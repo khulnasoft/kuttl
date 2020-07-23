@@ -33,9 +33,11 @@ type Case struct {
 	Dir        string
 	SkipDelete bool
 	Timeout    int
+	Namespace  string
 
 	Client          func(forceNew bool) (client.Client, error)
 	DiscoveryClient func() (discovery.DiscoveryInterface, error)
+	CaseCustomTests map[string]CustomTest
 
 	Logger testutils.Logger
 }
@@ -60,7 +62,7 @@ func (t *Case) DeleteNamespace(namespace string) error {
 }
 
 // CreateNamespace creates a namespace in Kubernetes to use for a test.
-func (t *Case) CreateNamespace(namespace string) error {
+func (t *Case) CreateNamespace(namespace string, annotations map[string]string) error {
 	t.Logger.Log("Creating namespace:", namespace)
 
 	cl, err := t.Client(false)
@@ -70,7 +72,8 @@ func (t *Case) CreateNamespace(namespace string) error {
 
 	return cl.Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: namespace,
+			Name:        namespace,
+			Annotations: annotations,
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "Namespace",
@@ -124,10 +127,11 @@ func printEvents(events []eventsbeta1.Event, logger conversion.DebugLogger) {
 // Run runs a test case including all of its steps.
 func (t *Case) Run(test *testing.T, tc *report.Testcase) {
 	test.Parallel()
-	ns := fmt.Sprintf("kudo-test-%s", petname.Generate(2, "-"))
 
-	if err := t.CreateNamespace(ns); err != nil {
-		test.Fatal(err)
+	ns := t.Namespace
+
+	if ns == "" {
+		test.Fatal("Namespace does not exist")
 	}
 
 	if !t.SkipDelete {
@@ -162,6 +166,20 @@ func (t *Case) Run(test *testing.T, tc *report.Testcase) {
 			}
 			test.Error(caseErr)
 			break
+		}
+		customTest := t.CaseCustomTests[testStep.Name]
+		if customTest != nil {
+			customTestClient := t.Client
+			customTestDiscoveryClient := t.DiscoveryClient
+			customTestLogger := t.Logger.WithPrefix("custom test for " + testStep.String())
+			if errs := customTest(test, ns, customTestClient, customTestDiscoveryClient, customTestLogger); len(errs) > 0 {
+				for _, err := range errs {
+					test.Error(err)
+				}
+
+				test.Error(fmt.Errorf("failed in custom test for step %s", testStep.String()))
+				break
+			}
 		}
 	}
 
@@ -217,7 +235,19 @@ func (t *Case) CollectTestStepFiles() (map[int64][]string, error) {
 }
 
 // LoadTestSteps loads all of the test steps for a test case.
-func (t *Case) LoadTestSteps() error {
+func (t *Case) LoadTestSteps(annotations map[string]string) error {
+
+	ns := t.Namespace
+
+	if ns == "" {
+		ns = fmt.Sprintf("kudo-test-%s", petname.Generate(2, "-"))
+
+		if err := t.CreateNamespace(ns, annotations); err != nil {
+			return err
+		}
+		t.Namespace = ns
+	}
+
 	testStepFiles, err := t.CollectTestStepFiles()
 	if err != nil {
 		return err
@@ -236,7 +266,7 @@ func (t *Case) LoadTestSteps() error {
 		}
 
 		for _, file := range files {
-			if err := testStep.LoadYAML(file); err != nil {
+			if err := testStep.LoadYAML(file, ns); err != nil {
 				return err
 			}
 		}

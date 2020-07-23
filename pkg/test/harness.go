@@ -30,25 +30,36 @@ import (
 	testutils "github.com/kudobuilder/kuttl/pkg/test/utils"
 )
 
+type CustomTest func(
+	t *testing.T,
+	namespace string,
+	client func(forceNew bool) (client.Client, error),
+	DiscoveryClient func() (discovery.DiscoveryInterface, error),
+	Logger testutils.Logger,
+) []error
+
 // Harness loads and runs tests based on the configuration provided.
 type Harness struct {
 	TestSuite harness.TestSuite
 	T         *testing.T
 
-	logger         testutils.Logger
-	managerStopCh  chan struct{}
-	config         *rest.Config
-	docker         testutils.DockerClient
-	client         client.Client
-	dclient        discovery.DiscoveryInterface
-	env            *envtest.Environment
-	kind           *kind
-	kubeConfigPath string
-	clientLock     sync.Mutex
-	configLock     sync.Mutex
-	stopping       bool
-	bgProcesses    []*exec.Cmd
-	report         *report.Testsuites
+	logger               testutils.Logger
+	managerStopCh        chan struct{}
+	config               *rest.Config
+	docker               testutils.DockerClient
+	client               client.Client
+	dclient              discovery.DiscoveryInterface
+	env                  *envtest.Environment
+	kind                 *kind
+	kubeConfigPath       string
+	clientLock           sync.Mutex
+	configLock           sync.Mutex
+	stopping             bool
+	bgProcesses          []*exec.Cmd
+	report               *report.Testsuites
+	SuiteCustomTests     map[string]map[string]CustomTest
+	NamespaceAnnotations map[string]string
+	InCluster            bool
 }
 
 // LoadTests loads all of the tests in a given directory.
@@ -131,6 +142,7 @@ func (h *Harness) RunKIND() (*rest.Config, error) {
 				return nil, err
 			}
 		}
+
 
 		dockerClient, err := h.DockerClient()
 		if err != nil {
@@ -217,7 +229,10 @@ func (h *Harness) Config() (*rest.Config, error) {
 
 	var err error
 
-	if h.TestSuite.StartControlPlane {
+	if h.InCluster {
+		h.T.Log("running tests by fetching the incluster config (running in a Pod).")
+		h.config, err = rest.InClusterConfig()
+	} else if h.TestSuite.StartControlPlane {
 		h.T.Log("running tests with a mocked control plane (kube-apiserver and etcd).")
 		h.config, err = h.RunTestEnv()
 	} else if h.TestSuite.StartKIND {
@@ -319,11 +334,12 @@ func (h *Harness) RunTests() {
 
 				test.Client = h.Client
 				test.DiscoveryClient = h.DiscoveryClient
+				test.CaseCustomTests = h.SuiteCustomTests[test.Name]
 
 				t.Run(test.Name, func(t *testing.T) {
 					test.Logger = testutils.NewTestLogger(t, test.Name)
 
-					if err := test.LoadTestSteps(); err != nil {
+					if err := test.LoadTestSteps(h.NamespaceAnnotations); err != nil {
 						t.Fatal(err)
 					}
 
@@ -332,6 +348,7 @@ func (h *Harness) RunTests() {
 					suite.AddTestcase(tc)
 				})
 			}
+
 		}
 	})
 
@@ -339,10 +356,11 @@ func (h *Harness) RunTests() {
 }
 
 // Run the test harness - start the control plane and then run the tests.
-func (h *Harness) Run() {
+func (h *Harness) Run() *report.Testsuites {
 	h.Setup()
 	h.RunTests()
 	h.Report()
+	return h.report
 }
 
 // Setup spins up the test env based on configuration
