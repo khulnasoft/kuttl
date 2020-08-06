@@ -59,6 +59,7 @@ type Harness struct {
 	report               *report.Testsuites
 	SuiteCustomTests     map[string]map[string]CustomTest
 	NamespaceAnnotations map[string]string
+	NamespaceLabels      map[string]string
 	InCluster            bool
 }
 
@@ -142,7 +143,6 @@ func (h *Harness) RunKIND() (*rest.Config, error) {
 				return nil, err
 			}
 		}
-
 
 		dockerClient, err := h.DockerClient()
 		if err != nil {
@@ -339,7 +339,7 @@ func (h *Harness) RunTests() {
 				t.Run(test.Name, func(t *testing.T) {
 					test.Logger = testutils.NewTestLogger(t, test.Name)
 
-					if err := test.LoadTestSteps(h.NamespaceAnnotations); err != nil {
+					if err := test.LoadTestSteps(h.NamespaceAnnotations, h.NamespaceLabels); err != nil {
 						t.Fatal(err)
 					}
 
