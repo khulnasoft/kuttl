@@ -336,6 +336,7 @@ func (h *Harness) RunTests() {
 				test.DiscoveryClient = h.DiscoveryClient
 				test.CaseCustomTests = h.SuiteCustomTests[test.Name]
 
+				time.Sleep(120 * time.Second)
 				t.Run(test.Name, func(t *testing.T) {
 					test.Logger = testutils.NewTestLogger(t, test.Name)
 
