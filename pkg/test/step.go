@@ -2,19 +2,13 @@ package test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
-	"strings"
-	"testing"
 	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -22,36 +16,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	harness "github.com/kudobuilder/kuttl/pkg/apis/testharness/v1beta1"
-	"github.com/kudobuilder/kuttl/pkg/env"
 	kfile "github.com/kudobuilder/kuttl/pkg/file"
 	"github.com/kudobuilder/kuttl/pkg/http"
 	testutils "github.com/kudobuilder/kuttl/pkg/test/utils"
 )
 
-// fileNameRegex contains two capturing groups to determine whether a file has special
-// meaning (ex. assert) or contains an appliable object, and extra name elements.
-var fileNameRegex = regexp.MustCompile(`^(?:\d+-)?([^-\.]+)(-[^\.]+)?(?:\.yaml)?$`)
+var fileNameRegex = regexp.MustCompile(`^(\d+-)?([^.]+)(.yaml)?$`)
 
 // A Step contains the name of the test step, its index in the test,
 // and all of the test step's settings (including objects to apply and assert on).
 type Step struct {
-	Name       string
-	Index      int
-	SkipDelete bool
+	Name  string
+	Index int
 
-	Dir           string
-	TestRunLabels labels.Set
+	Dir string
 
 	Step   *harness.TestStep
 	Assert *harness.TestAssert
 
-	Asserts []client.Object
-	Apply   []client.Object
-	Errors  []client.Object
+	Asserts []runtime.Object
+	Apply   []runtime.Object
+	Errors  []runtime.Object
 
 	Timeout int
 
-	Kubeconfig      string
 	Client          func(forceNew bool) (client.Client, error)
 	DiscoveryClient func() (discovery.DiscoveryInterface, error)
 
@@ -96,7 +84,7 @@ func (s *Step) DeleteExisting(namespace string) error {
 		return err
 	}
 
-	toDelete := []client.Object{}
+	toDelete := []runtime.Object{}
 
 	if s.Step == nil {
 		return nil
@@ -141,28 +129,21 @@ func (s *Step) DeleteExisting(namespace string) error {
 			}
 		} else {
 			// Otherwise just append the object specified.
-			toDelete = append(toDelete, obj.DeepCopy())
+			toDelete = append(toDelete, obj.DeepCopyObject())
 		}
 	}
 
 	for _, obj := range toDelete {
-		del := &unstructured.Unstructured{}
-		del.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
-		del.SetName(obj.GetName())
-		del.SetNamespace(obj.GetNamespace())
-
-		err := cl.Delete(context.TODO(), del)
+		err := cl.Delete(context.TODO(), obj.DeepCopyObject())
 		if err != nil && !k8serrors.IsNotFound(err) {
 			return err
 		}
 	}
 
 	// Wait for resources to be deleted.
-	return wait.PollUntilContextTimeout(context.TODO(), 100*time.Millisecond, time.Duration(s.GetTimeout())*time.Second, true, func(ctx context.Context) (done bool, err error) {
+	return wait.PollImmediate(100*time.Millisecond, time.Duration(s.GetTimeout())*time.Second, func() (done bool, err error) {
 		for _, obj := range toDelete {
-			actual := &unstructured.Unstructured{}
-			actual.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
-			err = cl.Get(ctx, testutils.ObjectKey(obj), actual)
+			err = cl.Get(context.TODO(), testutils.ObjectKey(obj), obj.DeepCopyObject())
 			if err == nil || !k8serrors.IsNotFound(err) {
 				return false, err
 			}
@@ -173,7 +154,7 @@ func (s *Step) DeleteExisting(namespace string) error {
 }
 
 // Create applies all resources defined in the Apply list.
-func (s *Step) Create(test *testing.T, namespace string) []error {
+func (s *Step) Create(namespace string) []error {
 	cl, err := s.Client(true)
 	if err != nil {
 		return []error{err}
@@ -192,25 +173,10 @@ func (s *Step) Create(test *testing.T, namespace string) []error {
 			errors = append(errors, err)
 			continue
 		}
-		ctx := context.Background()
-		if s.Timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, time.Duration(s.Timeout)*time.Second)
-			defer cancel()
-		}
 
-		if updated, err := testutils.CreateOrUpdate(ctx, cl, obj, true); err != nil {
+		if updated, err := testutils.CreateOrUpdate(context.TODO(), cl, obj, true); err != nil {
 			errors = append(errors, err)
 		} else {
-			// if the object was created, register cleanup
-			if !updated && !s.SkipDelete {
-				obj := obj
-				test.Cleanup(func() {
-					if err := cl.Delete(context.TODO(), obj); err != nil && !k8serrors.IsNotFound(err) {
-						test.Error(err)
-					}
-				})
-			}
 			action := "created"
 			if updated {
 				action = "updated"
@@ -231,17 +197,13 @@ func (s *Step) GetTimeout() int {
 	return timeout
 }
 
-func list(cl client.Client, gvk schema.GroupVersionKind, namespace string, labelsMap map[string]string) ([]unstructured.Unstructured, error) {
+func list(cl client.Client, gvk schema.GroupVersionKind, namespace string) ([]unstructured.Unstructured, error) {
 	list := unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(gvk)
 
 	listOptions := []client.ListOption{}
 	if namespace != "" {
 		listOptions = append(listOptions, client.InNamespace(namespace))
-	}
-
-	if len(labelsMap) > 0 {
-		listOptions = append(listOptions, client.MatchingLabels(labelsMap))
 	}
 
 	if err := cl.List(context.TODO(), &list, listOptions...); err != nil {
@@ -273,32 +235,27 @@ func (s *Step) CheckResource(expected runtime.Object, namespace string) []error 
 	gvk := expected.GetObjectKind().GroupVersionKind()
 
 	actuals := []unstructured.Unstructured{}
+
 	if name != "" {
 		actual := unstructured.Unstructured{}
 		actual.SetGroupVersionKind(gvk)
 
-		if err := cl.Get(context.TODO(), client.ObjectKey{
+		err = cl.Get(context.TODO(), client.ObjectKey{
 			Namespace: namespace,
 			Name:      name,
-		}, &actual); err != nil {
-			return append(testErrors, err)
-		}
+		}, &actual)
 
 		actuals = append(actuals, actual)
 	} else {
-		m, err := meta.Accessor(expected)
-		if err != nil {
-			return append(testErrors, err)
-		}
-		matches, err := list(cl, gvk, namespace, m.GetLabels())
-		if err != nil {
-			return append(testErrors, err)
-		}
-		if len(matches) == 0 {
+		actuals, err = list(cl, gvk, namespace)
+		if len(actuals) == 0 {
 			testErrors = append(testErrors, fmt.Errorf("no resources matched of kind: %s", gvk.String()))
 		}
-		actuals = append(actuals, matches...)
 	}
+	if err != nil {
+		return append(testErrors, err)
+	}
+
 	expectedObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(expected)
 	if err != nil {
 		return append(testErrors, err)
@@ -306,11 +263,11 @@ func (s *Step) CheckResource(expected runtime.Object, namespace string) []error 
 
 	for _, actual := range actuals {
 		actual := actual
+
 		tmpTestErrors := []error{}
 
 		if err := testutils.IsSubset(expectedObj, actual.UnstructuredContent()); err != nil {
-			diff, diffErr := testutils.PrettyDiff(
-				&unstructured.Unstructured{Object: expectedObj}, &actual)
+			diff, diffErr := testutils.PrettyDiff(expected, &actual)
 			if diffErr == nil {
 				tmpTestErrors = append(tmpTestErrors, fmt.Errorf(diff))
 			} else {
@@ -368,11 +325,7 @@ func (s *Step) CheckResourceAbsent(expected runtime.Object, namespace string) er
 
 		actuals = []unstructured.Unstructured{actual}
 	} else {
-		m, err := meta.Accessor(expected)
-		if err != nil {
-			return err
-		}
-		actuals, err = list(cl, gvk, namespace, m.GetLabels())
+		actuals, err = list(cl, gvk, namespace)
 		if err != nil {
 			return err
 		}
@@ -383,42 +336,21 @@ func (s *Step) CheckResourceAbsent(expected runtime.Object, namespace string) er
 		return err
 	}
 
-	var unexpectedObjects []unstructured.Unstructured
 	for _, actual := range actuals {
 		if err := testutils.IsSubset(expectedObj, actual.UnstructuredContent()); err == nil {
-			unexpectedObjects = append(unexpectedObjects, actual)
+			return fmt.Errorf("resource matched of kind: %s", gvk.String())
 		}
 	}
 
-	if len(unexpectedObjects) == 0 {
-		return nil
-	}
-	if len(unexpectedObjects) == 1 {
-		return fmt.Errorf("resource %s %s matched error assertion", unexpectedObjects[0].GroupVersionKind(), unexpectedObjects[0].GetName())
-	}
-	return fmt.Errorf("resource %s %s (and %d other resources) matched error assertion", unexpectedObjects[0].GroupVersionKind(), unexpectedObjects[0].GetName(), len(unexpectedObjects)-1)
-}
-
-// CheckAssertCommands Runs the commands provided in `commands` and check if have been run successfully.
-// the errors returned can be a a failure of executing the command or the failure of the command executed.
-func (s *Step) CheckAssertCommands(ctx context.Context, namespace string, commands []harness.TestAssertCommand, timeout int) []error {
-	testErrors := []error{}
-	if _, err := testutils.RunAssertCommands(ctx, s.Logger, namespace, commands, "", timeout, s.Kubeconfig); err != nil {
-		testErrors = append(testErrors, err)
-	}
-	return testErrors
+	return nil
 }
 
 // Check checks if the resources defined in Asserts and Errors are in the correct state.
-func (s *Step) Check(namespace string, timeout int) []error {
+func (s *Step) Check(namespace string) []error {
 	testErrors := []error{}
 
 	for _, expected := range s.Asserts {
 		testErrors = append(testErrors, s.CheckResource(expected, namespace)...)
-	}
-
-	if s.Assert != nil {
-		testErrors = append(testErrors, s.CheckAssertCommands(context.TODO(), namespace, s.Assert.Commands, timeout)...)
 	}
 
 	for _, expected := range s.Errors {
@@ -433,7 +365,7 @@ func (s *Step) Check(namespace string, timeout int) []error {
 // Run runs a KUTTL test step:
 // 1. Apply all desired objects to Kubernetes.
 // 2. Wait for all of the states defined in the test step's asserts to be true.'
-func (s *Step) Run(test *testing.T, namespace string) []error {
+func (s *Step) Run(namespace string) []error {
 	s.Logger.Log("starting test step", s.String())
 
 	if err := s.DeleteExisting(namespace); err != nil {
@@ -449,54 +381,33 @@ func (s *Step) Run(test *testing.T, namespace string) []error {
 				command.Background = false
 			}
 		}
-		if _, err := testutils.RunCommands(context.TODO(), s.Logger, namespace, s.Step.Commands, s.Dir, s.Timeout, s.Kubeconfig); err != nil {
-			testErrors = append(testErrors, err)
+		if _, errors := testutils.RunCommands(s.Logger, namespace, s.Step.Commands, s.Dir, s.Timeout); errors != nil {
+			testErrors = append(testErrors, errors...)
 		}
 	}
 
-	testErrors = append(testErrors, s.Create(test, namespace)...)
+	testErrors = append(testErrors, s.Create(namespace)...)
 
 	if len(testErrors) != 0 {
 		return testErrors
 	}
 
-	timeoutF := float64(s.GetTimeout())
-	start := time.Now()
-
-	for elapsed := 0.0; elapsed < timeoutF; elapsed = time.Since(start).Seconds() {
-		testErrors = s.Check(namespace, int(timeoutF-elapsed))
+	for i := 0; i < s.GetTimeout(); i++ {
+		testErrors = s.Check(namespace)
 
 		if len(testErrors) == 0 {
 			break
 		}
-		if hasTimeoutErr(testErrors) {
-			break
-		}
+
 		time.Sleep(time.Second)
 	}
 
-	// all is good
 	if len(testErrors) == 0 {
 		s.Logger.Log("test step completed", s.String())
-		return testErrors
+	} else {
+		s.Logger.Log("test step failed", s.String())
 	}
-	// test failure processing
-	s.Logger.Log("test step failed", s.String())
-	if s.Assert == nil {
-		return testErrors
-	}
-	for _, collector := range s.Assert.Collectors {
-		s.Logger.Logf("collecting log output for %s", collector.String())
-		if collector.Command() == nil {
-			s.Logger.Log("skipping invalid assertion collector")
-			continue
-		}
-		_, err := testutils.RunCommand(context.TODO(), namespace, *collector.Command(), s.Dir, s.Logger, s.Logger, s.Logger, s.Timeout, s.Kubeconfig)
-		if err != nil {
-			s.Logger.Log("post assert collector failure: %s", err)
-		}
-	}
-	s.Logger.Flush()
+
 	return testErrors
 }
 
@@ -505,27 +416,38 @@ func (s *Step) String() string {
 	return fmt.Sprintf("%d-%s", s.Index, s.Name)
 }
 
-// LoadYAML loads the resources from a YAML file for a test step:
-//   - If the YAML file is called "assert", then it contains objects to
-//     add to the test step's list of assertions.
-//   - If the YAML file is called "errors", then it contains objects that,
-//     if seen, mark a test immediately failed.
-//   - All other YAML files are considered resources to create.
-func (s *Step) LoadYAML(file string) error {
-	skipFile, objects, err := s.loadOrSkipFile(file)
-	if skipFile || err != nil {
-		return err
+// LoadYAMLFromFile loads the resources from a YAML file for a test step:
+// * If the YAML file is called "assert", then it contains objects to
+//   add to the test step's list of assertions.
+// * If the YAML file is called "errors", then it contains objects that,
+//   if seen, mark a test immediately failed.
+// * All other YAML files are considered resources to create.
+func (s *Step) LoadYAML(file string, namespace string) error {
+	objects, err := testutils.LoadYAMLFromFile(file, namespace)
+	if err != nil {
+		return fmt.Errorf("loading %s: %s", file, err)
 	}
 
-	if err = s.populateObjectsByFileName(filepath.Base(file), objects); err != nil {
-		return fmt.Errorf("populating step: %v", err)
+	matches := fileNameRegex.FindStringSubmatch(filepath.Base(file))
+	fname := matches[2]
+
+	switch fname {
+	case "assert":
+		s.Asserts = append(s.Asserts, objects...)
+	case "errors":
+		s.Errors = append(s.Errors, objects...)
+	default:
+		if s.Name == "" {
+			s.Name = fname
+		}
+		s.Apply = append(s.Apply, objects...)
 	}
 
-	asserts := []client.Object{}
+	asserts := []runtime.Object{}
 
 	for _, obj := range s.Asserts {
 		if obj.GetObjectKind().GroupVersionKind().Kind == "TestAssert" {
-			if testAssert, ok := obj.DeepCopyObject().(*harness.TestAssert); ok {
+			if testAssert, ok := obj.(*harness.TestAssert); ok {
 				s.Assert = testAssert
 			} else {
 				return fmt.Errorf("failed to load TestAssert object from %s: it contains an object of type %T", file, obj)
@@ -535,7 +457,7 @@ func (s *Step) LoadYAML(file string) error {
 		}
 	}
 
-	applies := []client.Object{}
+	applies := []runtime.Object{}
 
 	for _, obj := range s.Apply {
 		if obj.GetObjectKind().GroupVersionKind().Kind == "TestStep" {
@@ -551,10 +473,6 @@ func (s *Step) LoadYAML(file string) error {
 			if s.Step.Name != "" {
 				s.Name = s.Step.Name
 			}
-			if s.Step.Kubeconfig != "" {
-				exKubeconfig := env.Expand(s.Step.Kubeconfig)
-				s.Kubeconfig = cleanPath(exKubeconfig, s.Dir)
-			}
 		} else {
 			applies = append(applies, obj)
 		}
@@ -564,28 +482,25 @@ func (s *Step) LoadYAML(file string) error {
 	if s.Step != nil {
 		// process configured step applies
 		for _, applyPath := range s.Step.Apply {
-			exApply := env.Expand(applyPath)
-			apply, err := ObjectsFromPath(exApply, s.Dir)
+			apply, err := runtimeObjectsFromPath(s, applyPath)
 			if err != nil {
-				return fmt.Errorf("step %q apply path %s: %w", s.Name, exApply, err)
+				return err
 			}
 			applies = append(applies, apply...)
 		}
 		// process configured step asserts
 		for _, assertPath := range s.Step.Assert {
-			exAssert := env.Expand(assertPath)
-			assert, err := ObjectsFromPath(exAssert, s.Dir)
+			assert, err := runtimeObjectsFromPath(s, assertPath)
 			if err != nil {
-				return fmt.Errorf("step %q assert path %s: %w", s.Name, exAssert, err)
+				return err
 			}
 			asserts = append(asserts, assert...)
 		}
 		// process configured errors
 		for _, errorPath := range s.Step.Error {
-			exError := env.Expand(errorPath)
-			errObjs, err := ObjectsFromPath(exError, s.Dir)
+			errObjs, err := runtimeObjectsFromPath(s, errorPath)
 			if err != nil {
-				return fmt.Errorf("step %q error path %s: %w", s.Name, exError, err)
+				return err
 			}
 			s.Errors = append(s.Errors, errObjs...)
 		}
@@ -596,102 +511,23 @@ func (s *Step) LoadYAML(file string) error {
 	return nil
 }
 
-func (s *Step) loadOrSkipFile(file string) (bool, []client.Object, error) {
-	loadedObjects, err := testutils.LoadYAMLFromFile(file)
-	if err != nil {
-		return false, nil, fmt.Errorf("loading %s: %s", file, err)
-	}
-
-	var objects []client.Object
-	shouldSkip := false
-	testFileObjEncountered := false
-
-	for i, object := range loadedObjects {
-		if testFileObject, ok := object.(*harness.TestFile); ok {
-			if testFileObjEncountered {
-				return false, nil, fmt.Errorf("more than one TestFile object encountered in file %q", file)
-			}
-			testFileObjEncountered = true
-			selector, err := metav1.LabelSelectorAsSelector(testFileObject.TestRunSelector)
-			if err != nil {
-				return false, nil, fmt.Errorf("unrecognized test run selector in object %d of %q: %w", i, file, err)
-			}
-			if selector.Empty() || selector.Matches(s.TestRunLabels) {
-				continue
-			}
-			fmt.Printf("Skipping file %q, label selector does not match test run labels.\n", file)
-			shouldSkip = true
-		} else {
-			objects = append(objects, object)
-		}
-	}
-	return shouldSkip, objects, nil
-}
-
-// populateObjectsByFileName populates s.Asserts, s.Errors, and/or s.Apply for files containing
-// "assert", "errors", or no special string, respectively.
-func (s *Step) populateObjectsByFileName(fileName string, objects []client.Object) error {
-	matches := fileNameRegex.FindStringSubmatch(fileName)
-	if len(matches) < 2 {
-		return fmt.Errorf("%s does not match file name regexp: %s", fileName, testStepRegex.String())
-	}
-
-	switch fname := strings.ToLower(matches[1]); fname {
-	case "assert":
-		s.Asserts = append(s.Asserts, objects...)
-	case "errors":
-		s.Errors = append(s.Errors, objects...)
-	default:
-		if s.Name == "" {
-			if len(matches) > 2 {
-				// The second matching group will already have a hyphen prefix.
-				s.Name = matches[1] + matches[2]
-			} else {
-				s.Name = matches[1]
-			}
-		}
-		s.Apply = append(s.Apply, objects...)
-	}
-
-	return nil
-}
-
-// ObjectsFromPath returns an array of runtime.Objects for files / urls provided
-func ObjectsFromPath(path, dir string) ([]client.Object, error) {
+func runtimeObjectsFromPath(s *Step, path string) ([]runtime.Object, error) {
 	if http.IsURL(path) {
-		apply, err := http.ToObjects(path)
+		apply, err := http.ToRuntimeObjects(path)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("step %q apply %w", s.Name, err)
 		}
 		return apply, nil
 	}
 
 	// it's a directory or file
-	cPath := cleanPath(path, dir)
-	paths, err := kfile.FromPath(cPath, "*.yaml")
+	paths, err := kfile.FromPath(filepath.Join(s.Dir, path), "*.yaml")
 	if err != nil {
-		return nil, fmt.Errorf("failed to find YAML files in %s: %w", cPath, err)
+		return nil, fmt.Errorf("step %q apply %w", s.Name, err)
 	}
-	apply, err := kfile.ToObjects(paths)
+	apply, err := kfile.ToRuntimeObjects(paths)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("step %q apply %w", s.Name, err)
 	}
 	return apply, nil
-}
-
-// cleanPath returns either the abs path or the joined path
-func cleanPath(path, dir string) string {
-	if filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(dir, path)
-}
-
-func hasTimeoutErr(err []error) bool {
-	for i := range err {
-		if errors.Is(err[i], context.DeadlineExceeded) {
-			return true
-		}
-	}
-	return false
 }

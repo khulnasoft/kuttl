@@ -27,8 +27,7 @@ import (
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,16 +52,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/kudobuilder/kuttl/pkg/apis"
 	harness "github.com/kudobuilder/kuttl/pkg/apis/testharness/v1beta1"
-	"github.com/kudobuilder/kuttl/pkg/env"
 )
+
+// This token will be replaced with the actual namespace name in the yaml string
+const NAMESPACE_TOKEN = "<NAMESPACE>"
 
 // ensure that we only add to the scheme once.
 var schemeLock sync.Once
 
-// TODO (kensipe): need to consider options around AlwaysAdmin https://github.com/kudobuilder/kudo/pull/1420/files#r391449597
+// APIServerDefaultArgs are copied from the internal controller-runtime pkg/internal/testing/integration/internal/apiserver.go
+// sadly, we can't import them anymore since it is an internal package
+var APIServerDefaultArgs = []string{
+	"--advertise-address=127.0.0.1",
+	"--etcd-servers={{ if .EtcdURL }}{{ .EtcdURL.String }}{{ end }}",
+	"--cert-dir={{ .CertDir }}",
+	"--insecure-port={{ if .URL }}{{ .URL.Port }}{{ end }}",
+	"--insecure-bind-address={{ if .URL }}{{ .URL.Hostname }}{{ end }}",
+	"--secure-port={{ if .SecurePort }}{{ .SecurePort }}{{ end }}",
+	"--disable-admission-plugins=ServiceAccount,NamespaceLifecycle",
+	"--service-cluster-ip-range=10.0.0.0/24",
+	"--advertise-address={{ if .URL }}{{ .URL.Hostname }}{{ end }}",
+}
+
+//TODO (kensipe): need to consider options around AlwaysAdmin https://github.com/kudobuilder/kudo/pull/1420/files#r391449597
 
 // IsJSONSyntaxError returns true if the error is a JSON syntax error.
 func IsJSONSyntaxError(err error) bool {
@@ -88,25 +104,12 @@ func Retry(ctx context.Context, fn func(context.Context) error, errValidationFun
 	errCh := make(chan error)
 	doneCh := make(chan struct{})
 
-	if fn == nil {
-		log.Println("retry func is nil and will be ignored")
-		return nil
-	}
-
 	// do { } while (err != nil): https://stackoverflow.com/a/32844744/10892393
 	for ok := true; ok; ok = lastErr != nil {
 		// run the function in a goroutine and close it once it is finished so that
 		// we can use select to wait for both the function return and the context deadline.
 
 		go func() {
-			// if the func we are calling panics, clean up and call it done
-			// the common case is when a shared reference, like a client, is nil and is called in the function
-			defer func() {
-				if r := recover(); r != nil {
-					errCh <- errors.New("func passed to retry panicked.  expected if testsuite is shutting down")
-				}
-			}()
-
 			if err := fn(ctx); err != nil {
 				errCh <- err
 			} else {
@@ -164,11 +167,7 @@ func NewRetryClient(cfg *rest.Config, opts client.Options) (*RetryClient, error)
 	}
 
 	if opts.Mapper == nil {
-		httpClient, err := rest.HTTPClientFor(cfg)
-		if err != nil {
-			return nil, err
-		}
-		opts.Mapper, err = apiutil.NewDynamicRESTMapper(cfg, httpClient)
+		opts.Mapper, err = apiutil.NewDynamicRESTMapper(cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -178,47 +177,22 @@ func NewRetryClient(cfg *rest.Config, opts client.Options) (*RetryClient, error)
 	return &RetryClient{Client: client, dynamic: dynamicClient, discovery: discovery}, err
 }
 
-// Scheme returns the scheme this client is using.
-func (r *RetryClient) Scheme() *runtime.Scheme {
-	return r.Client.Scheme()
-}
-
-// RESTMapper returns the rest mapper this client is using.
-func (r *RetryClient) RESTMapper() meta.RESTMapper {
-	return r.Client.RESTMapper()
-}
-
-// SubResource returns a subresource client for the named subResource.
-func (r *RetryClient) SubResource(subResource string) client.SubResourceClient {
-	return r.Client.SubResource(subResource)
-}
-
-// GroupVersionKindFor returns the GroupVersionKind for the provided object.
-func (r *RetryClient) GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error) {
-	return r.Client.GroupVersionKindFor(obj)
-}
-
-// IsObjectNamespaced returns true if the object is namespaced.
-func (r *RetryClient) IsObjectNamespaced(obj runtime.Object) (bool, error) {
-	return r.Client.IsObjectNamespaced(obj)
-}
-
 // Create saves the object obj in the Kubernetes cluster.
-func (r *RetryClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+func (r *RetryClient) Create(ctx context.Context, obj runtime.Object, opts ...client.CreateOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.Create(ctx, obj, opts...)
 	}, IsJSONSyntaxError)
 }
 
 // Delete deletes the given obj from Kubernetes cluster.
-func (r *RetryClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+func (r *RetryClient) Delete(ctx context.Context, obj runtime.Object, opts ...client.DeleteOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.Delete(ctx, obj, opts...)
 	}, IsJSONSyntaxError)
 }
 
 // DeleteAllOf deletes the given obj from Kubernetes cluster.
-func (r *RetryClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
+func (r *RetryClient) DeleteAllOf(ctx context.Context, obj runtime.Object, opts ...client.DeleteAllOfOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.DeleteAllOf(ctx, obj, opts...)
 	}, IsJSONSyntaxError)
@@ -226,7 +200,7 @@ func (r *RetryClient) DeleteAllOf(ctx context.Context, obj client.Object, opts .
 
 // Update updates the given obj in the Kubernetes cluster. obj must be a
 // struct pointer so that obj can be updated with the content returned by the Server.
-func (r *RetryClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+func (r *RetryClient) Update(ctx context.Context, obj runtime.Object, opts ...client.UpdateOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.Update(ctx, obj, opts...)
 	}, IsJSONSyntaxError)
@@ -234,7 +208,7 @@ func (r *RetryClient) Update(ctx context.Context, obj client.Object, opts ...cli
 
 // Patch patches the given obj in the Kubernetes cluster. obj must be a
 // struct pointer so that obj can be updated with the content returned by the Server.
-func (r *RetryClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+func (r *RetryClient) Patch(ctx context.Context, obj runtime.Object, patch client.Patch, opts ...client.PatchOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.Patch(ctx, obj, patch, opts...)
 	}, IsJSONSyntaxError)
@@ -243,23 +217,23 @@ func (r *RetryClient) Patch(ctx context.Context, obj client.Object, patch client
 // Get retrieves an obj for the given object key from the Kubernetes Cluster.
 // obj must be a struct pointer so that obj can be updated with the response
 // returned by the Server.
-func (r *RetryClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+func (r *RetryClient) Get(ctx context.Context, key client.ObjectKey, obj runtime.Object) error {
 	return Retry(ctx, func(ctx context.Context) error {
-		return r.Client.Get(ctx, key, obj, opts...)
+		return r.Client.Get(ctx, key, obj)
 	}, IsJSONSyntaxError)
 }
 
 // List retrieves list of objects for a given namespace and list options. On a
 // successful call, Items field in the list will be populated with the
 // result returned from the server.
-func (r *RetryClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+func (r *RetryClient) List(ctx context.Context, list runtime.Object, opts ...client.ListOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.Client.List(ctx, list, opts...)
 	}, IsJSONSyntaxError)
 }
 
 // Watch watches a specific object and returns all events for it.
-func (r *RetryClient) Watch(_ context.Context, obj runtime.Object) (watch.Interface, error) {
+func (r *RetryClient) Watch(ctx context.Context, obj runtime.Object) (watch.Interface, error) {
 	meta, err := meta.Accessor(obj)
 	if err != nil {
 		return nil, err
@@ -277,7 +251,7 @@ func (r *RetryClient) Watch(_ context.Context, obj runtime.Object) (watch.Interf
 		return nil, err
 	}
 
-	return r.dynamic.Resource(mapping.Resource).Watch(context.TODO(), metav1.SingleObject(metav1.ObjectMeta{
+	return r.dynamic.Resource(mapping.Resource).Watch(metav1.SingleObject(metav1.ObjectMeta{
 		Name:      meta.GetName(),
 		Namespace: meta.GetNamespace(),
 	}))
@@ -290,17 +264,9 @@ func (r *RetryClient) Status() client.StatusWriter {
 	}
 }
 
-// Create saves the subResource object in the Kubernetes cluster. obj must be a
-// struct pointer so that obj can be updated with the content returned by the Server.
-func (r *RetryStatusWriter) Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
-	return Retry(ctx, func(ctx context.Context) error {
-		return r.StatusWriter.Create(ctx, obj, subResource, opts...)
-	}, IsJSONSyntaxError)
-}
-
 // Update updates the given obj in the Kubernetes cluster. obj must be a
 // struct pointer so that obj can be updated with the content returned by the Server.
-func (r *RetryStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+func (r *RetryStatusWriter) Update(ctx context.Context, obj runtime.Object, opts ...client.UpdateOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.StatusWriter.Update(ctx, obj, opts...)
 	}, IsJSONSyntaxError)
@@ -308,7 +274,7 @@ func (r *RetryStatusWriter) Update(ctx context.Context, obj client.Object, opts 
 
 // Patch patches the given obj in the Kubernetes cluster. obj must be a
 // struct pointer so that obj can be updated with the content returned by the Server.
-func (r *RetryStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+func (r *RetryStatusWriter) Patch(ctx context.Context, obj runtime.Object, patch client.Patch, opts ...client.PatchOption) error {
 	return Retry(ctx, func(ctx context.Context) error {
 		return r.StatusWriter.Patch(ctx, obj, patch, opts...)
 	}, IsJSONSyntaxError)
@@ -321,12 +287,8 @@ func Scheme() *runtime.Scheme {
 			fmt.Printf("failed to add API resources to the scheme: %v", err)
 			os.Exit(-1)
 		}
-		if err := apiextv1.AddToScheme(scheme.Scheme); err != nil {
-			fmt.Printf("failed to add V1 API extension resources to the scheme: %v", err)
-			os.Exit(-1)
-		}
-		if err := apiextv1beta1.AddToScheme(scheme.Scheme); err != nil {
-			fmt.Printf("failed to add V1beta1 API extension resources to the scheme: %v", err)
+		if err := apiextensions.AddToScheme(scheme.Scheme); err != nil {
+			fmt.Printf("failed to add API extension resources to the scheme: %v", err)
 			os.Exit(-1)
 		}
 	})
@@ -361,6 +323,7 @@ func Namespaced(dClient discovery.DiscoveryInterface, obj runtime.Object, namesp
 
 	resource, err := GetAPIResource(dClient, obj.GetObjectKind().GroupVersionKind())
 	if err != nil {
+
 		return "", "", fmt.Errorf("retrieving API resource for %v failed: %v", obj.GetObjectKind().GroupVersionKind(), err)
 	}
 
@@ -372,65 +335,8 @@ func Namespaced(dClient discovery.DiscoveryInterface, obj runtime.Object, namesp
 	return m.GetName(), namespace, nil
 }
 
-func pruneLargeAdditions(expected *unstructured.Unstructured, actual *unstructured.Unstructured) runtime.Object {
-	pruned := actual.DeepCopy()
-	prune(expected.Object, pruned.Object)
-	return pruned
-}
-
-// prune replaces some fields in the actual tree to make it smaller for display.
-//
-// The goal is to make diffs on large objects much less verbose but not any less useful,
-// by omitting these fields in the object which are not specified in the assertion and are at least
-// moderately long when serialized.
-//
-// This way, for example when asserting on status.availableReplicas of a Deployment
-// (which is missing if zero replicas are available) will still show the status.unavailableReplicas
-// for example, but will omit spec completely unless the assertion also mentions it.
-//
-// This saves hundreds to thousands of lines of logs to scroll when debugging failures of some operator tests.
-func prune(expected map[string]interface{}, actual map[string]interface{}) {
-	// This value was chosen so that it is low enough to hide huge fields like `metadata.managedFields`,
-	// but large enough such that for example a typical `metadata.labels` still shows,
-	// since it might be useful for identifying reported objects like pods.
-	// This could potentially be turned into a knob in the future.
-	const maxLines = 10
-	var toRemove []string
-	for k, v := range actual {
-		if _, inExpected := expected[k]; inExpected {
-			expectedMap, isExpectedMap := expected[k].(map[string]interface{})
-			actualMap, isActualMap := actual[k].(map[string]interface{})
-			if isActualMap && isExpectedMap {
-				prune(expectedMap, actualMap)
-			}
-			continue
-		}
-		numLines, err := countLines(k, v)
-		if err != nil || numLines < maxLines {
-			continue
-		}
-		toRemove = append(toRemove, k)
-	}
-	for _, s := range toRemove {
-		actual[s] = fmt.Sprintf("[... elided field over %d lines long ...]", maxLines)
-	}
-}
-
-func countLines(k string, v interface{}) (int, error) {
-	buf := strings.Builder{}
-	dummyObj := &unstructured.Unstructured{
-		Object: map[string]interface{}{k: v}}
-	err := MarshalObject(dummyObj, &buf)
-	if err != nil {
-		return 0, fmt.Errorf("cannot marshal field %s to compute its length in lines: %w", k, err)
-	}
-	return strings.Count(buf.String(), "\n"), nil
-}
-
 // PrettyDiff creates a unified diff highlighting the differences between two Kubernetes resources
-func PrettyDiff(expected *unstructured.Unstructured, actual *unstructured.Unstructured) (string, error) {
-	actualPruned := pruneLargeAdditions(expected, actual)
-
+func PrettyDiff(expected runtime.Object, actual runtime.Object) (string, error) {
 	expectedBuf := &bytes.Buffer{}
 	actualBuf := &bytes.Buffer{}
 
@@ -438,7 +344,7 @@ func PrettyDiff(expected *unstructured.Unstructured, actual *unstructured.Unstru
 		return "", err
 	}
 
-	if err := MarshalObject(actualPruned, actualBuf); err != nil {
+	if err := MarshalObject(actual, actualBuf); err != nil {
 		return "", err
 	}
 
@@ -455,31 +361,27 @@ func PrettyDiff(expected *unstructured.Unstructured, actual *unstructured.Unstru
 
 // ConvertUnstructured converts an unstructured object to the known struct. If the type is not known, then
 // the unstructured object is returned unmodified.
-func ConvertUnstructured(in client.Object) (client.Object, error) {
+func ConvertUnstructured(in runtime.Object) (runtime.Object, error) {
 	unstruct, err := runtime.DefaultUnstructuredConverter.ToUnstructured(in)
 	if err != nil {
 		return nil, fmt.Errorf("error converting %s to unstructured error: %w", ResourceID(in), err)
 	}
 
-	var converted client.Object
+	var converted runtime.Object
 
 	kind := in.GetObjectKind().GroupVersionKind().Kind
 	group := in.GetObjectKind().GroupVersionKind().Group
 
+	// Deprecated: kudo.dev is deprecated.
+	kudoGroup := "kudo.dev"
 	kuttlGroup := "kuttl.dev"
-	if group != kuttlGroup {
-		return in, nil
-	}
-	switch {
-	case kind == "TestFile":
-		converted = &harness.TestFile{}
-	case kind == "TestStep":
+	if (group == kudoGroup || group == kuttlGroup) && kind == "TestStep" {
 		converted = &harness.TestStep{}
-	case kind == "TestAssert":
+	} else if (group == kudoGroup || group == kuttlGroup) && kind == "TestAssert" {
 		converted = &harness.TestAssert{}
-	case kind == "TestSuite":
+	} else if (group == kudoGroup || group == kuttlGroup) && kind == "TestSuite" {
 		converted = &harness.TestSuite{}
-	default:
+	} else {
 		return in, nil
 	}
 
@@ -556,24 +458,34 @@ func MarshalObjectJSON(o runtime.Object, w io.Writer) error {
 }
 
 // LoadYAMLFromFile loads all objects from a YAML file.
-func LoadYAMLFromFile(path string) ([]client.Object, error) {
+func LoadYAMLFromFile(path string, namespace string) ([]runtime.Object, error) {
 	opened, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer opened.Close()
 
-	return LoadYAML(path, opened)
+	return LoadYAML(path, opened, namespace)
 }
 
-// LoadYAML loads all objects from a reader
-func LoadYAML(path string, r io.Reader) ([]client.Object, error) {
+func LoadYAML(path string, r io.Reader, namespace string) ([]runtime.Object, error) {
 	yamlReader := yaml.NewYAMLReader(bufio.NewReader(r))
 
-	objects := []client.Object{}
+	objects := []runtime.Object{}
 
 	for {
 		data, err := yamlReader.Read()
+
+		/*
+			The following code snippet updates the yaml files such that the NAMESPACE_TOKEN's value
+			is replaced with the namespace variable. This has affect only when the caller function
+			passes a  namespace
+		*/
+		if namespace != "" {
+			dataStr := string(data)
+			data = []byte(strings.ReplaceAll(dataStr, NAMESPACE_TOKEN, namespace))
+		}
+
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -599,9 +511,11 @@ func LoadYAML(path string, r io.Reader) ([]client.Object, error) {
 		} else {
 			objects = append(objects, obj)
 		}
+
 	}
 
 	return objects, nil
+
 }
 
 // MatchesKind returns true if the Kubernetes kind of obj matches any of kinds.
@@ -618,14 +532,14 @@ func MatchesKind(obj runtime.Object, kinds ...runtime.Object) bool {
 }
 
 // InstallManifests recurses over ManifestsDir to install all resources defined in YAML manifests.
-func InstallManifests(ctx context.Context, c client.Client, dClient discovery.DiscoveryInterface, manifestsDir string, kinds ...runtime.Object) ([]*apiextv1.CustomResourceDefinition, error) {
-	crds := []*apiextv1.CustomResourceDefinition{}
+func InstallManifests(ctx context.Context, client client.Client, dClient discovery.DiscoveryInterface, manifestsDir string, kinds ...runtime.Object) ([]runtime.Object, error) {
+	objects := []runtime.Object{}
 
 	if manifestsDir == "" {
-		return crds, nil
+		return objects, nil
 	}
 
-	return crds, filepath.Walk(manifestsDir, func(path string, info os.FileInfo, err error) error {
+	return objects, filepath.Walk(manifestsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -643,20 +557,13 @@ func InstallManifests(ctx context.Context, c client.Client, dClient discovery.Di
 			return nil
 		}
 
-		objs, err := LoadYAMLFromFile(path)
+		objs, err := LoadYAMLFromFile(path, "")
 		if err != nil {
 			return err
 		}
 
 		for _, obj := range objs {
 			if len(kinds) > 0 && !MatchesKind(obj, kinds...) {
-				var expectedKinds []string
-				// it is expected that it is highly unlikely to be here (an unmatched kind)
-				// which is the justification for have a loop in a loop
-				for _, k := range kinds {
-					expectedKinds = append(expectedKinds, k.GetObjectKind().GroupVersionKind().String())
-				}
-				log.Printf("Skipping resource %s because it does not match expected kinds: %s", obj.GetObjectKind().GroupVersionKind().String(), strings.Join(expectedKinds, ","))
 				continue
 			}
 
@@ -667,7 +574,7 @@ func InstallManifests(ctx context.Context, c client.Client, dClient discovery.Di
 				}
 			}
 
-			updated, err := CreateOrUpdate(ctx, c, obj, true)
+			updated, err := CreateOrUpdate(ctx, client, obj, true)
 			if err != nil {
 				return fmt.Errorf("error creating resource %s: %w", ResourceID(obj), err)
 			}
@@ -679,16 +586,7 @@ func InstallManifests(ctx context.Context, c client.Client, dClient discovery.Di
 			// TODO: use test logger instead of Go logger
 			log.Println(ResourceID(obj), action)
 
-			newCrd := apiextv1.CustomResourceDefinition{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       obj.GetObjectKind().GroupVersionKind().Kind,
-					APIVersion: obj.GetObjectKind().GroupVersionKind().Version,
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: obj.GetName(),
-				},
-			}
-			crds = append(crds, &newCrd)
+			objects = append(objects, obj)
 		}
 
 		return nil
@@ -697,7 +595,7 @@ func InstallManifests(ctx context.Context, c client.Client, dClient discovery.Di
 
 // ObjectKey returns an instantiated ObjectKey for the provided object.
 func ObjectKey(obj runtime.Object) client.ObjectKey {
-	m, _ := meta.Accessor(obj) //nolint:errcheck // runtime.Object don't have the error issues of interface{}
+	m, _ := meta.Accessor(obj)
 	return client.ObjectKey{
 		Name:      m.GetName(),
 		Namespace: m.GetNamespace(),
@@ -705,13 +603,11 @@ func ObjectKey(obj runtime.Object) client.ObjectKey {
 }
 
 // NewResource generates a Kubernetes object using the provided apiVersion, kind, name, and namespace.
-// The name and namespace are omitted if empty.
-func NewResource(apiVersion, kind, name, namespace string) *unstructured.Unstructured {
-	meta := map[string]interface{}{}
-
-	if name != "" {
-		meta["name"] = name
+func NewResource(apiVersion, kind, name, namespace string) runtime.Object {
+	meta := map[string]interface{}{
+		"name": name,
 	}
+
 	if namespace != "" {
 		meta["namespace"] = namespace
 	}
@@ -727,6 +623,7 @@ func NewResource(apiVersion, kind, name, namespace string) *unstructured.Unstruc
 
 // NewClusterRoleBinding Create a clusterrolebinding for the serviceAccount passed
 func NewClusterRoleBinding(apiVersion, kind, name, namespace string, serviceAccount string, roleName string) runtime.Object {
+
 	sa := &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -755,44 +652,23 @@ func NewClusterRoleBinding(apiVersion, kind, name, namespace string, serviceAcco
 }
 
 // NewPod creates a new pod object.
-func NewPod(name, namespace string) *unstructured.Unstructured {
+func NewPod(name, namespace string) runtime.Object {
 	return NewResource("v1", "Pod", name, namespace)
-}
-
-// NewV1Pod returns a new corev1.Pod object.
-// Each of name, namespace and serviceAccountName are set if non-empty.
-func NewV1Pod(name, namespace, serviceAccountName string) *corev1.Pod {
-	pod := corev1.Pod{}
-	pod.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "",
-		Version: "v1",
-		Kind:    "Pod",
-	})
-	if name != "" {
-		pod.SetName(name)
-	}
-	if namespace != "" {
-		pod.SetNamespace(namespace)
-	}
-	if serviceAccountName != "" {
-		pod.Spec.ServiceAccountName = serviceAccountName
-	}
-	return &pod
 }
 
 // WithNamespace naively applies the namespace to the object. Used mainly in tests, otherwise
 // use Namespaced.
-func WithNamespace(obj *unstructured.Unstructured, namespace string) *unstructured.Unstructured {
-	res := obj.DeepCopy()
+func WithNamespace(obj runtime.Object, namespace string) runtime.Object {
+	obj = obj.DeepCopyObject()
 
-	m, _ := meta.Accessor(res) //nolint:errcheck // runtime.Object don't have the error issues of interface{}
+	m, _ := meta.Accessor(obj)
 	m.SetNamespace(namespace)
 
-	return res
+	return obj
 }
 
 // WithSpec applies the provided spec to the Kubernetes object.
-func WithSpec(t *testing.T, obj *unstructured.Unstructured, spec map[string]interface{}) *unstructured.Unstructured {
+func WithSpec(t *testing.T, obj runtime.Object, spec map[string]interface{}) runtime.Object {
 	res, err := WithKeyValue(obj, "spec", spec)
 	if err != nil {
 		t.Fatalf("failed to apply spec %v to object %v: %v", spec, obj, err)
@@ -801,7 +677,7 @@ func WithSpec(t *testing.T, obj *unstructured.Unstructured, spec map[string]inte
 }
 
 // WithStatus applies the provided status to the Kubernetes object.
-func WithStatus(t *testing.T, obj *unstructured.Unstructured, status map[string]interface{}) *unstructured.Unstructured {
+func WithStatus(t *testing.T, obj runtime.Object, status map[string]interface{}) runtime.Object {
 	res, err := WithKeyValue(obj, "status", status)
 	if err != nil {
 		t.Fatalf("failed to apply status %v to object %v: %v", status, obj, err)
@@ -810,13 +686,14 @@ func WithStatus(t *testing.T, obj *unstructured.Unstructured, status map[string]
 }
 
 // WithKeyValue sets key in the provided object to value.
-func WithKeyValue(obj *unstructured.Unstructured, key string, value map[string]interface{}) (*unstructured.Unstructured, error) {
-	obj = obj.DeepCopy()
-	// we need to convert to and from unstructured here so that the types in case_test match when comparing
+func WithKeyValue(obj runtime.Object, key string, value map[string]interface{}) (runtime.Object, error) {
+	obj = obj.DeepCopyObject()
+
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return nil, err
 	}
+
 	content[key] = value
 
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(content, obj); err != nil {
@@ -826,8 +703,8 @@ func WithKeyValue(obj *unstructured.Unstructured, key string, value map[string]i
 }
 
 // WithLabels sets the labels on an object.
-func WithLabels(t *testing.T, obj *unstructured.Unstructured, labels map[string]string) *unstructured.Unstructured {
-	obj = obj.DeepCopy()
+func WithLabels(t *testing.T, obj runtime.Object, labels map[string]string) runtime.Object {
+	obj = obj.DeepCopyObject()
 
 	m, err := meta.Accessor(obj)
 	if err != nil {
@@ -842,7 +719,7 @@ func WithLabels(t *testing.T, obj *unstructured.Unstructured, labels map[string]
 func WithAnnotations(obj runtime.Object, annotations map[string]string) runtime.Object {
 	obj = obj.DeepCopyObject()
 
-	m, _ := meta.Accessor(obj) //nolint:errcheck // runtime.Object don't have the error issues of interface{}
+	m, _ := meta.Accessor(obj)
 	m.SetAnnotations(annotations)
 
 	return obj
@@ -882,13 +759,7 @@ func FakeDiscoveryClient() discovery.DiscoveryInterface {
 					},
 				},
 				{
-					GroupVersion: apiextv1.SchemeGroupVersion.String(),
-					APIResources: []metav1.APIResource{
-						{Name: "customresourcedefinitions", Namespaced: false, Kind: "CustomResourceDefinition"},
-					},
-				},
-				{
-					GroupVersion: apiextv1beta1.SchemeGroupVersion.String(),
+					GroupVersion: apiextensions.SchemeGroupVersion.String(),
 					APIResources: []metav1.APIResource{
 						{Name: "customresourcedefinitions", Namespaced: false, Kind: "CustomResourceDefinition"},
 					},
@@ -901,7 +772,7 @@ func FakeDiscoveryClient() discovery.DiscoveryInterface {
 // CreateOrUpdate will create obj if it does not exist and update if it it does.
 // retryonerror indicates whether we retry in case of conflict
 // Returns true if the object was updated and false if it was created.
-func CreateOrUpdate(ctx context.Context, cl client.Client, obj client.Object, retryOnError bool) (updated bool, err error) {
+func CreateOrUpdate(ctx context.Context, cl client.Client, obj runtime.Object, retryOnError bool) (updated bool, err error) {
 	orig := obj.DeepCopyObject()
 
 	validators := []func(err error) bool{k8serrors.IsAlreadyExists}
@@ -909,12 +780,12 @@ func CreateOrUpdate(ctx context.Context, cl client.Client, obj client.Object, re
 	if retryOnError {
 		validators = append(validators, k8serrors.IsConflict)
 	}
-	err = Retry(ctx, func(ctx context.Context) error {
-		expected := orig.DeepCopyObject()
-		actual := &unstructured.Unstructured{}
-		actual.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
 
-		err := cl.Get(ctx, ObjectKey(expected), actual)
+	return updated, Retry(ctx, func(ctx context.Context) error {
+		expected := orig.DeepCopyObject()
+		actual := orig.DeepCopyObject()
+
+		err := cl.Get(ctx, ObjectKey(actual), actual)
 		if err == nil {
 			if err = PatchObject(actual, expected); err != nil {
 				return err
@@ -934,22 +805,20 @@ func CreateOrUpdate(ctx context.Context, cl client.Client, obj client.Object, re
 		}
 		return err
 	}, validators...)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		err = errors.New("create/update timeout exceeded")
-	}
-	return updated, err
 }
 
 // SetAnnotation sets the given key and value in the object's annotations, returning a copy.
-func SetAnnotation(obj *unstructured.Unstructured, key, value string) *unstructured.Unstructured {
-	obj = obj.DeepCopy()
+func SetAnnotation(obj runtime.Object, key, value string) runtime.Object {
+	obj = obj.DeepCopyObject()
 
-	annotations := obj.GetAnnotations()
+	meta, _ := meta.Accessor(obj)
+
+	annotations := meta.GetAnnotations()
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
 	annotations[key] = value
-	obj.SetAnnotations(annotations)
+	meta.SetAnnotations(annotations)
 
 	return obj
 }
@@ -975,11 +844,9 @@ func GetAPIResource(dClient discovery.DiscoveryInterface, gvk schema.GroupVersio
 // WaitForDelete waits for the provide runtime objects to be deleted from cluster
 func WaitForDelete(c *RetryClient, objs []runtime.Object) error {
 	// Wait for resources to be deleted.
-	return wait.PollUntilContextTimeout(context.TODO(), 100*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
+	return wait.PollImmediate(100*time.Millisecond, 10*time.Second, func() (done bool, err error) {
 		for _, obj := range objs {
-			actual := &unstructured.Unstructured{}
-			actual.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
-			err = c.Get(ctx, ObjectKey(obj), actual)
+			err = c.Get(context.TODO(), ObjectKey(obj), obj.DeepCopyObject())
 			if err == nil || !k8serrors.IsNotFound(err) {
 				return false, err
 			}
@@ -989,29 +856,43 @@ func WaitForDelete(c *RetryClient, objs []runtime.Object) error {
 	})
 }
 
-// WaitForSA waits for a service account to be present
-func WaitForSA(config *rest.Config, name, namespace string) error {
-	c, err := NewRetryClient(config, client.Options{
-		Scheme: Scheme(),
-	})
-	if err != nil {
-		return err
+// WaitForCRDs waits for the provided CRD types to be available in the Kubernetes API.
+func WaitForCRDs(dClient discovery.DiscoveryInterface, crds []runtime.Object) error {
+	waitingFor := []schema.GroupVersionKind{}
+	crdKind := NewResource("apiextensions.k8s.io/v1beta1", "CustomResourceDefinition", "", "")
+
+	for _, crdObj := range crds {
+		if !MatchesKind(crdObj, crdKind) {
+			return fmt.Errorf("the following passed object does not match %v: %v", crdKind, crdObj)
+		}
+
+		switch crd := crdObj.(type) {
+		case *apiextensions.CustomResourceDefinition:
+			waitingFor = append(waitingFor, schema.GroupVersionKind{
+				Group:   crd.Spec.Group,
+				Version: crd.Spec.Version,
+				Kind:    crd.Spec.Names.Kind,
+			})
+		case *unstructured.Unstructured:
+			waitingFor = append(waitingFor, schema.GroupVersionKind{
+				Group:   crd.Object["spec"].(map[string]interface{})["group"].(string),
+				Version: crd.Object["spec"].(map[string]interface{})["version"].(string),
+				Kind:    crd.Object["spec"].(map[string]interface{})["names"].(map[string]interface{})["kind"].(string),
+			})
+		default:
+			return fmt.Errorf("the folllowing passed object is not a CRD: %v", crdObj)
+		}
 	}
 
-	obj := &corev1.ServiceAccount{}
+	return wait.PollImmediate(100*time.Millisecond, 10*time.Second, func() (done bool, err error) {
+		for _, resource := range waitingFor {
+			_, err := GetAPIResource(dClient, resource)
+			if err != nil {
+				fmt.Printf("Waiting for resource %s... \n", resource)
+				return false, nil
+			}
+		}
 
-	key := client.ObjectKey{
-		Namespace: namespace,
-		Name:      name,
-	}
-	return wait.PollUntilContextTimeout(context.TODO(), 500*time.Millisecond, 60*time.Second, true, func(ctx context.Context) (done bool, err error) {
-		err = c.Get(ctx, key, obj)
-		if k8serrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
 		return true, nil
 	})
 }
@@ -1033,9 +914,9 @@ type TestEnvironment struct {
 
 // StartTestEnvironment is a wrapper for controller-runtime's envtest that creates a Kubernetes API server and etcd
 // suitable for use in tests.
-func StartTestEnvironment(attachControlPlaneOutput bool) (env TestEnvironment, err error) {
+func StartTestEnvironment(KubeAPIServerFlags []string) (env TestEnvironment, err error) {
 	env.Environment = &envtest.Environment{
-		AttachControlPlaneOutput: attachControlPlaneOutput,
+		KubeAPIServerFlags: KubeAPIServerFlags,
 	}
 
 	env.Config, err = env.Environment.Start()
@@ -1053,8 +934,35 @@ func StartTestEnvironment(attachControlPlaneOutput bool) (env TestEnvironment, e
 	return
 }
 
+// provides OS expansion of defined ENV VARs inside args to commands.  The expansion is limited to what is defined on the OS
+// and the variables passed into to the env parameter. To escape a dollar sign, pass in two dollar signs.
+func ExpandEnv(c string, env map[string]string) string {
+	// expand $$ -> $
+	fullEnv := map[string]string{
+		"$": "$",
+	}
+
+	// add all OS environment variables to the map
+	for _, envVar := range os.Environ() {
+		splitVar := strings.SplitN(envVar, "=", 2)
+		if len(splitVar) != 2 {
+			continue
+		}
+		fullEnv[splitVar[0]] = splitVar[1]
+	}
+
+	// add env parameter variables to map
+	for k, v := range env {
+		fullEnv[k] = v
+	}
+
+	return os.Expand(c, func(s string) string {
+		return fullEnv[s]
+	})
+}
+
 // GetArgs parses a command line string into its arguments and appends a namespace if it is not already set.
-func GetArgs(ctx context.Context, cmd harness.Command, namespace string, envMap map[string]string) (*exec.Cmd, error) {
+func GetArgs(ctx context.Context, cmd harness.Command, namespace string, env map[string]string) (*exec.Cmd, error) {
 	argSlice := []string{}
 
 	if cmd.Command != "" && cmd.Script != "" {
@@ -1068,11 +976,10 @@ func GetArgs(ctx context.Context, cmd harness.Command, namespace string, envMap 
 	}
 
 	if cmd.Script != "" {
-		// #nosec G204 sec is challenged by a variable being used by exec, but that is by design
 		builtCmd := exec.CommandContext(ctx, "sh", "-c", cmd.Script)
 		return builtCmd, nil
 	}
-	c := env.ExpandWithMap(cmd.Command, envMap)
+	c := ExpandEnv(cmd.Command, env)
 
 	argSplit, err := shlex.Split(c)
 	if err != nil {
@@ -1104,16 +1011,16 @@ func GetArgs(ctx context.Context, cmd harness.Command, namespace string, envMap 
 // RunCommand runs a command with args.
 // args gets split on spaces (respecting quoted strings).
 // if the command is run in the background a reference to the process is returned for later cleanup
-func RunCommand(ctx context.Context, namespace string, cmd harness.Command, cwd string, stdout io.Writer, stderr io.Writer, logger Logger, timeout int, kubeconfigOverride string) (*exec.Cmd, error) {
+func RunCommand(ctx context.Context, namespace string, cmd harness.Command, cwd string, stdout io.Writer, stderr io.Writer, logger Logger, timeout int) (*exec.Cmd, error) {
 	actualDir, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("command %q with %w", cmd.String(), err)
+		return nil, err
 	}
 
-	kuttlENV := make(map[string]string)
-	kuttlENV["NAMESPACE"] = namespace
-	kuttlENV["KUBECONFIG"] = kubeconfigPath(actualDir, kubeconfigOverride)
-	kuttlENV["PATH"] = fmt.Sprintf("%s/bin/:%s", actualDir, os.Getenv("PATH"))
+	kudoENV := make(map[string]string)
+	kudoENV["NAMESPACE"] = namespace
+	kudoENV["KUBECONFIG"] = fmt.Sprintf("%s/kubeconfig", actualDir)
+	kudoENV["PATH"] = fmt.Sprintf("%s/bin/:%s", actualDir, os.Getenv("PATH"))
 
 	// by default testsuite timeout is the command timeout
 	// 0 is allowed for testsuite which means forever (or no timeout)
@@ -1137,9 +1044,9 @@ func RunCommand(ctx context.Context, namespace string, cmd harness.Command, cwd 
 		defer cancel()
 	}
 
-	builtCmd, err := GetArgs(cmdCtx, cmd, namespace, kuttlENV)
+	builtCmd, err := GetArgs(cmdCtx, cmd, namespace, kudoENV)
 	if err != nil {
-		return nil, fmt.Errorf("processing command %q with %w", cmd.String(), err)
+		return nil, err
 	}
 
 	logger.Logf("running command: %v", builtCmd.Args)
@@ -1150,7 +1057,7 @@ func RunCommand(ctx context.Context, namespace string, cmd harness.Command, cwd 
 		builtCmd.Stderr = stderr
 	}
 	builtCmd.Env = os.Environ()
-	for key, value := range kuttlENV {
+	for key, value := range kudoENV {
 		builtCmd.Env = append(builtCmd.Env, fmt.Sprintf("%s=%s", key, value))
 	}
 
@@ -1173,68 +1080,28 @@ func RunCommand(ctx context.Context, namespace string, cmd harness.Command, cwd 
 		return nil, nil
 	}
 	if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("command %q exceeded %v sec timeout, %w", cmd.String(), timeout, cmdCtx.Err())
+		return nil, fmt.Errorf("command %q exceeded %v sec timeout", cmd.Command, timeout)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("command %q failed, %w", cmd.String(), err)
-	}
-	return nil, nil
-}
-
-func kubeconfigPath(actualDir, override string) string {
-	if override != "" {
-		if filepath.IsAbs(override) {
-			return override
-		}
-		return filepath.Join(actualDir, override)
-	}
-	return fmt.Sprintf("%s/kubeconfig", actualDir)
-}
-
-// convertAssertCommand converts a set of TestAssertCommand to Commands so it all the existing functions can be used
-// that expect Commands data type.
-func convertAssertCommand(assertCommands []harness.TestAssertCommand, timeout int) (commands []harness.Command) {
-	commands = make([]harness.Command, 0, len(assertCommands))
-
-	for _, assertCommand := range assertCommands {
-		commands = append(commands, harness.Command{
-			Command:       assertCommand.Command,
-			Namespaced:    assertCommand.Namespaced,
-			Script:        assertCommand.Script,
-			SkipLogOutput: assertCommand.SkipLogOutput,
-			Timeout:       timeout,
-			// This fields will always be this constants for assertions
-			IgnoreFailure: false,
-			Background:    false,
-		})
-	}
-
-	return commands
-}
-
-// RunAssertCommands runs a set of commands specified as TestAssertCommand
-func RunAssertCommands(ctx context.Context, logger Logger, namespace string, commands []harness.TestAssertCommand, workdir string, timeout int, kubeconfigOverride string) ([]*exec.Cmd, error) {
-	return RunCommands(ctx, logger, namespace, convertAssertCommand(commands, timeout), workdir, timeout, kubeconfigOverride)
+	return nil, err
 }
 
 // RunCommands runs a set of commands, returning any errors.
-// If any (non-background) command fails, the following commands are skipped
+// If `command` is set, then `command` will be the command that is invoked (if a command specifies it already, it will not be prepended again).
 // commands running in the background are returned
-func RunCommands(ctx context.Context, logger Logger, namespace string, commands []harness.Command, workdir string, timeout int, kubeconfigOverride string) ([]*exec.Cmd, error) {
+func RunCommands(logger Logger, namespace string, commands []harness.Command, workdir string, timeout int) ([]*exec.Cmd, []error) {
+	errs := []error{}
 	bgs := []*exec.Cmd{}
 
 	if commands == nil {
 		return nil, nil
 	}
 
-	for i, cmd := range commands {
-		bg, err := RunCommand(ctx, namespace, cmd, workdir, logger, logger, logger, timeout, kubeconfigOverride)
+	for _, cmd := range commands {
+		logger.Logf("running command: %q", cmd.Command)
+
+		bg, err := RunCommand(context.Background(), namespace, cmd, workdir, logger, logger, logger, timeout)
 		if err != nil {
-			cmdListSize := len(commands)
-			if i+1 < cmdListSize {
-				logger.Logf("command failure, skipping %d additional commands", cmdListSize-i-1)
-			}
-			return bgs, err
+			errs = append(errs, err)
 		}
 		if bg != nil {
 			bgs = append(bgs, bg)
@@ -1248,7 +1115,7 @@ func RunCommands(ctx context.Context, logger Logger, namespace string, commands 
 		logger.Log("background processes", bgs)
 	}
 	// handling of errs and bg processes external to this function
-	return bgs, nil
+	return bgs, errs
 }
 
 // Kubeconfig converts a rest.Config into a YAML kubeconfig and writes it to w
@@ -1320,4 +1187,14 @@ func Kubeconfig(cfg *rest.Config, w io.Writer) error {
 			},
 		},
 	}, w)
+}
+
+func GetDiscoveryClient(mgr manager.Manager) (*discovery.DiscoveryClient, error) {
+	// use manager rest config to create a discovery client
+	dc, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+	if err != nil || dc == nil {
+		return nil, fmt.Errorf("failed to create a discovery client: %v", err)
+	}
+
+	return dc, nil
 }
