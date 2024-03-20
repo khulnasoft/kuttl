@@ -6,10 +6,9 @@ import (
 	"io"
 	"testing"
 
-	dockertypes "github.com/docker/docker/api/types"
 	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/stretchr/testify/assert"
-	kindConfig "sigs.k8s.io/kind/pkg/apis/config/v1alpha3"
+	kindConfig "sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 )
 
 func TestGetTimeout(t *testing.T) {
@@ -18,6 +17,14 @@ func TestGetTimeout(t *testing.T) {
 
 	h.TestSuite.Timeout = 45
 	assert.Equal(t, 45, h.GetTimeout())
+}
+
+func TestGetReportName(t *testing.T) {
+	h := Harness{}
+	assert.Equal(t, "kuttl-report", h.reportName())
+
+	h.TestSuite.ReportName = "special-kuttl-report"
+	assert.Equal(t, "special-kuttl-report", h.reportName())
 }
 
 type dockerMock struct {
@@ -34,15 +41,15 @@ func newDockerMock() *dockerMock {
 	}
 }
 
-func (d *dockerMock) VolumeCreate(ctx context.Context, body volumetypes.VolumeCreateBody) (dockertypes.Volume, error) {
-	return dockertypes.Volume{
-		Mountpoint: fmt.Sprintf("/var/lib/docker/data/%s", body.Name),
+func (d *dockerMock) VolumeCreate(_ context.Context, options volumetypes.CreateOptions) (volumetypes.Volume, error) {
+	return volumetypes.Volume{
+		Mountpoint: fmt.Sprintf("/var/lib/docker/data/%s", options.Name),
 	}, nil
 }
 
-func (d *dockerMock) NegotiateAPIVersion(ctx context.Context) {}
+func (d *dockerMock) NegotiateAPIVersion(_ context.Context) {}
 
-func (d *dockerMock) ImageSave(ctx context.Context, imageIDs []string) (io.ReadCloser, error) {
+func (d *dockerMock) ImageSave(_ context.Context, _ []string) (io.ReadCloser, error) {
 	return d.imageReader, nil
 }
 

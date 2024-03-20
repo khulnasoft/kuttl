@@ -24,7 +24,7 @@ You can find the full text of the DCO here: https://developercertificate.org/
 ## Contributing Steps
 
 1. Submit an issue describing your proposed change to the repo in question.
-2. The [repo owners](https://github.com/kudobuilder/kuttl/blob/master/.github/CODEOWNERS) will respond to your issue promptly.
+2. The [repo owners](https://github.com/kudobuilder/kuttl/blob/main/.github/CODEOWNERS) will respond to your issue promptly.
 3. If your proposed change is accepted, and you haven't already done so, sign a Contributor License Agreement (see details above).
 4. Fork the desired repo, develop and test your code changes.
 5. Submit a pull request.
@@ -34,23 +34,80 @@ You can find the full text of the DCO here: https://developercertificate.org/
 ### Pre-requisites
 
 - Git
-- Go `1.13` or later. Note that some [Makefile](Makefile) targets assume that your `$GOBIN` is in your `$PATH`.
-- [Kubebuilder](https://book.kubebuilder.io/quick-start.html#installation) version 2 or later - note that it is only needed for the `kube-apiserver` and `etcd` binaries, so no need to install *its* dependencies (such as `kustomize`).
-- A Kubernetes Cluster running version `1.13` or later (e.g., [kind](https://kind.sigs.k8s.io/) or [Minikube](https://kubernetes.io/docs/tasks/tools/install-minikube/))
+- Go `1.18` or later. Note that some [Makefile](Makefile) targets assume that your `$GOBIN` is in your `$PATH`.
+- A Kubernetes Cluster running version `1.19` or later (e.g., [kind](https://kind.sigs.k8s.io/) or [Minikube](https://kubernetes.io/docs/tasks/tools/install-minikube/))
 - [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/)
+
+#### MacOS (darwin) and Go 1.18
+
+The `controller-gen` used with `make generate` has issues with Go 1.18 on MacOS darwin.  An example output looks like:
+
+```sh
+go: downloading golang.org/x/sys v0.0.0-20201112073958-5cba982894dd
+# golang.org/x/sys/unix
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/syscall_darwin.1_13.go:29:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.1_13.go:27:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.1_13.go:40:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:28:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:43:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:59:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:75:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:90:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:105:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:121:3: //go:linkname must refer to declared function or variable
+../../../../pkg/mod/golang.org/x/sys@v0.0.0-20201112073958-5cba982894dd/unix/zsyscall_darwin_arm64.go:121:3: too many errors
+make: *** [generate] Error 2
+```
+For the build to work you need proper version of `controller-gen` to be installed.  The current work around is:
+
+  1. change the `go.mod` L3 `go 1.18` to `go 1.17`
+  1. `make generate`
+  1. change `go.mod` back
+
+After the correct controller-gen version is installed.  All future builds will work.  The only time this work-around is necessary is if/when the controller-tools version is updated.  [The fix](https://go-review.googlesource.com/c/sys/+/274573/) has been merged into Go and should be resolved with go 1.18.1.
 
 ### Build Instructions
 
 - Get the KUTTL repo: `git clone https://github.com/kudobuilder/kuttl.git`
-- `cd kudo`
-- `make all` to build manager as well as CLI
+- `cd kuttl`
+- `make cli` to build the CLI
 
-#### Testing new CLI
-You can build CLI locally via `make cli`. After running that command, CLI will be available in `bin/kubectl-kuttl` and you can invoke the command for example like this `bin/kubectl-kuttl version` (no need to install it as kubectl plugin).
+After running this command, CLI will be available in `bin/kubectl-kuttl` and you can invoke the command for example like this `bin/kubectl-kuttl version` (no need to install it as `kubectl` plugin).
+
+### Debugging in VSCode
+
+Click Run > Add Configuration... to open the `launch.json` file. Add below configuration objects to specify the necessary sample tests and assertions in the `args[]`.
+
+```json
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "KUTTL Debug",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/kubectl-kuttl/main.go",
+      "args": [
+        "test", 
+        "sample", 
+        "--config=${workspaceFolder}/cmd/kubectl-kuttl/<sample_tests_dir_to_run_with_kuttl>"
+      ]
+    }
+  ]
+}
+```
 
 ### Testing
 
-See the [contributor's testing guide](https://github.com/kudobuilder/kudo/blob/master/test/README.md).
+Use `make all` to run all available tests.
+Run just `make` to see what individual targets are available.
+
+The project has settled on the [testify](https://github.com/stretchr/testify) library for testing purposes.
+Please use it for new tests as well if possible.
 
 ## Community, Discussion, and Support
 
@@ -66,7 +123,7 @@ You can reach the maintainers of this project at:
 This is a set of practices we try to live by when developing KUTTL. These are just defaults (soft rules). Deviations from them are possible, but have to be justified.
 
 ### General guidelines
-- Master is always releasable (green CI)
+- Main is always releasable (green CI)
 - All feature/bug-fixing work should have an open issue with a description, unless it's something very simple
 - Every user-facing feature that is NOT behind a feature gate should have integration or an e2e test
 
@@ -74,7 +131,7 @@ This is a set of practices we try to live by when developing KUTTL. These are ju
 - One core-team member has to approve the PR to be able to merge (all people listed in `.github/CODEOWNERS` file)
 - One approval is enough to merge. However, if there are requests for change they have to be resolved prior to the merge
 - Since KUTTL is developed in multiple timezones, try to keep the PR open for everyone to be able to see it (~24h, keep in mind public holidays)
-- We prefer squash commits so that all changes from a branch are committed to master as a single commit
+- We prefer squash commits so that all changes from a branch are committed to main as a single commit
 - Before you merge, make sure your commit title and description are meaningful. Github by default will list all the individual PR commits when squashing which are rarely insightful. We aim for a clean and meaningful commit history.
 - Labels: If your PR includes either **breaking changes** or should get additional attention in the release, add one of these label:
   - `release/highlight` For a big new feature, an important bug fix, the focus of the current release
@@ -109,7 +166,7 @@ It is unlikely an enhancement if it is:
 - performance improvements, which are only visible to users as faster API operations, or faster control loops
 - adding error messages or events
 
-If you are not sure, ask someone in the [#kudo](https://kubernetes.slack.com/messages/kudo/) channel on Slack or ping someone listed in [CODEOWNERS](https://github.com/kudobuilder/kudo/blob/master/.github/CODEOWNERS).
+If you are not sure, ask someone in the [#kudo](https://kubernetes.slack.com/messages/kudo/) channel on Slack or ping someone listed in [CODEOWNERS](https://github.com/kudobuilder/kudo/blob/main/.github/CODEOWNERS).
 
 ### When to Create a New Enhancement Issue
 
@@ -125,4 +182,4 @@ Create an issue in this repo once you:
 
 ## Code of Conduct
 
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](https://github.com/kudobuilder/kudo/blob/master/code-of-conduct.md).
+Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](https://github.com/kudobuilder/kudo/blob/main/code-of-conduct.md).

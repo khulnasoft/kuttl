@@ -33,16 +33,20 @@ var (
 
   Run a Kubernetes control plane and install manifests and CRDs for the running tests:
     kubectl kuttl test --start-control-plane  --crd-dir ./config/crds/ --manifests-dir ./test/manifests/ ./test/integration/
+
+  Run tests against an existing Kubernetes cluster with a JUnit XML file output:
+    kubectl kuttl test ./test/integration/ --report xml
 `
 )
 
 // newTestCmd creates the test command for the CLI
-func newTestCmd() *cobra.Command {
+func newTestCmd() *cobra.Command { //nolint:gocyclo
 	configPath := ""
 	crdDir := ""
 	manifestDirs := []string{}
 	testToRun := ""
 	startControlPlane := false
+	attachControlPlaneOutput := false
 	startKIND := false
 	kindConfig := ""
 	kindContext := ""
@@ -50,9 +54,14 @@ func newTestCmd() *cobra.Command {
 	skipClusterDelete := false
 	parallel := 0
 	artifactsDir := ""
+	// TODO: remove after v0.16.0 deprecated
 	mockControllerFile := ""
 	timeout := 30
 	reportFormat := ""
+	reportName := "kuttl-report"
+	namespace := ""
+	suppress := []string{}
+	var runLabels labelSetValue
 
 	options := harness.TestSuite{}
 
@@ -65,12 +74,10 @@ The test operator supports connecting to an existing Kubernetes cluster or it ca
 It can also apply manifests before running the tests. If no arguments are provided, the test harness will attempt to
 load the test configuration from kuttl-test.yaml.
 
-For more detailed documentation, visit: https://kudo.dev/docs/testing`,
+For more detailed documentation, visit: https://kuttl.dev`,
 		Example: testExample,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			flags := cmd.Flags()
-
-			options.TestDirs = args
 
 			// If a config is not set and kuttl-test.yaml exists, set configPath to kuttl-test.yaml.
 			if configPath == "" {
@@ -98,7 +105,6 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 						case *unstructured.Unstructured:
 							log.Println(fmt.Errorf("bad configuration in file %q", configPath))
 						}
-
 					} else {
 						log.Println(fmt.Errorf("unknown object type: %s", kind))
 					}
@@ -106,7 +112,6 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 			}
 
 			// Override configuration file options with any command line flags if they are set.
-
 			if isSet(flags, "crd-dir") {
 				options.CRDDir = crdDir
 			}
@@ -117,6 +122,10 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 
 			if isSet(flags, "start-control-plane") {
 				options.StartControlPlane = startControlPlane
+			}
+
+			if isSet(flags, "attach-control-plane-output") {
+				options.AttachControlPlaneOutput = attachControlPlaneOutput
 			}
 
 			if isSet(flags, "start-kind") {
@@ -140,6 +149,19 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 				return errors.New("only one of --start-control-plane and --start-kind can be set")
 			}
 
+			// after control-plane && start=kind check
+			if options.AttachControlPlaneOutput && !options.StartControlPlane {
+				return errors.New("only use --attach-control-plane-output with --start-control-plane")
+			}
+
+			// if we are working with a control plane we can not wait to delete ns (there is no ns controller)
+			// this is added before flags potentially override.  control plane should skip ns and cluster delete but
+			// perhaps there are cases where that is part of the test.  In general, there is no cluster to delete and
+			// there is no namespace controller.
+			if options.StartControlPlane {
+				options.SkipDelete = true
+			}
+
 			if isSet(flags, "skip-delete") {
 				options.SkipDelete = skipDelete
 			}
@@ -157,8 +179,32 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 				options.ReportFormat = reportType(ftype)
 			}
 
+			if isSet(flags, "report-name") {
+				options.ReportName = reportName
+			}
+
 			if isSet(flags, "artifacts-dir") {
 				options.ArtifactsDir = artifactsDir
+			}
+
+			if isSet(flags, "namespace") {
+				if strings.TrimSpace(namespace) == "" {
+					return errors.New(`setting namespace explicitly to "" or empty string is not supported`)
+				}
+				options.Namespace = namespace
+			}
+
+			if isSet(flags, "suppress-log") {
+				suppressSet := make(map[string]struct{})
+				for _, s := range append(options.Suppress, suppress...) {
+					suppressSet[strings.ToLower(s)] = struct{}{}
+				}
+				options.Suppress = make([]string, len(suppressSet))
+				i := 0
+				for s := range suppressSet {
+					options.Suppress[i] = s
+					i++
+				}
 			}
 
 			if isSet(flags, "timeout") {
@@ -166,23 +212,16 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 			}
 
 			if len(args) != 0 {
+				log.Println("kutt-test config testdirs is overridden with args: [", strings.Join(args, ", "), "]")
 				options.TestDirs = args
 			}
 
 			if len(options.TestDirs) == 0 {
 				return errors.New("no test directories provided, please provide either --config or test directories on the command line")
 			}
-			var APIServerArgs []string
-			var err error
 			if mockControllerFile != "" {
-				APIServerArgs, err = testutils.ReadMockControllerConfig(mockControllerFile)
-			} else {
-				APIServerArgs = testutils.APIServerDefaultArgs
+				log.Println("use of --control-plane-config is deprecated and no longer functions")
 			}
-			if err != nil {
-				return err
-			}
-			options.ControlPlaneArgs = APIServerArgs
 
 			return nil
 		},
@@ -191,6 +230,7 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 				harness := test.Harness{
 					TestSuite: options,
 					T:         t,
+					RunLabels: runLabels.AsLabelSet(),
 				}
 
 				harness.Run()
@@ -198,11 +238,13 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 		},
 	}
 
-	testCmd.Flags().StringVar(&configPath, "config", "", "Path to file to load test settings from (must not be set with any other arguments).")
+	testCmd.Flags().StringVar(&configPath, "config", "", "Path to file to load base test settings from (these may be overridden with command-line arguments).")
 	testCmd.Flags().StringVar(&crdDir, "crd-dir", "", "Directory to load CustomResourceDefinitions from prior to running the tests.")
 	testCmd.Flags().StringSliceVar(&manifestDirs, "manifest-dir", []string{}, "One or more directories containing manifests to apply before running the tests.")
 	testCmd.Flags().StringVar(&testToRun, "test", "", "If set, the specific test case to run.")
 	testCmd.Flags().BoolVar(&startControlPlane, "start-control-plane", false, "Start a local Kubernetes control plane for the tests (requires etcd and kube-apiserver binaries, cannot be used with --start-kind).")
+	testCmd.Flags().BoolVar(&attachControlPlaneOutput, "attach-control-plane-output", false, "Attaches control plane to stdout when using --start-control-plane.")
+	// TODO: remove after v0.16.0 deprecated mockControllerFile is not supported in the latest testenv
 	testCmd.Flags().StringVar(&mockControllerFile, "control-plane-config", "", "Path to file to load controller-runtime APIServer configuration arguments (only useful when --startControlPlane).")
 	testCmd.Flags().BoolVar(&startKIND, "start-kind", false, "Start a KIND cluster for the tests (cannot be used with --start-control-plane).")
 	testCmd.Flags().StringVar(&kindConfig, "kind-config", "", "Specify the KIND configuration file path (implies --start-kind, cannot be used with --start-control-plane).")
@@ -213,7 +255,11 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 	// The default value here is only used for the help message. The default is actually enforced in RunTests.
 	testCmd.Flags().IntVar(&parallel, "parallel", 8, "The maximum number of tests to run at once.")
 	testCmd.Flags().IntVar(&timeout, "timeout", 30, "The timeout to use as default for TestSuite configuration.")
-	testCmd.Flags().StringVar(&reportFormat, "report", "", "Specify JSON|XML for report.  Report location determined by --artfacts-dir.")
+	testCmd.Flags().StringVar(&reportFormat, "report", "", "Specify JSON|XML for report.  Report location determined by --artifacts-dir.")
+	testCmd.Flags().StringVar(&reportName, "report-name", "kuttl-report", "Name for the report.  Report location determined by --artifacts-dir and report file type determined by --report.")
+	testCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace to use for tests. Provided namespaces must exist prior to running tests.")
+	testCmd.Flags().StringSliceVar(&suppress, "suppress-log", []string{}, "Suppress logging for these kinds of logs (events).")
+	testCmd.Flags().Var(&runLabels, "test-run-labels", "Labels to use for this test run.")
 	// This cannot be a global flag because pkg/test/utils.RunTests calls flag.Parse which barfs on unknown top-level flags.
 	// Putting it here at least does not advertise it on a level where using it is impossible.
 	test.SetFlags(testCmd.Flags())
@@ -221,14 +267,14 @@ For more detailed documentation, visit: https://kudo.dev/docs/testing`,
 	return testCmd
 }
 
-func reportType(ftype report.Type) *report.Type {
+func reportType(ftype report.Type) string {
 	switch ftype {
 	case report.JSON:
 		fallthrough
 	case report.XML:
-		return &ftype
+		return string(ftype)
 	default:
-		return nil
+		return ""
 	}
 }
 

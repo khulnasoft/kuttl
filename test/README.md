@@ -7,15 +7,10 @@ To setup the tests locally, you need either:
 Or:
 
 * Go
-* kubebuilder
-
-## Downloading kubebuilder
-
-To setup kubebuilder, fetch the latest release from [Github](https://github.com/kubernetes-sigs/kubebuilder/releases) and extract `etcd` and `kube-apiserver` into `/usr/local/kubebuilder/bin/`.
 
 # Docker only
 
-If you don't want to install kubebuilder and other dependencies of KUTTL locally, you can build KUTTL and run the tests inside a Docker container.
+If you don't want to install Go and other dependencies of KUTTL locally, you can build KUTTL and run the tests inside a Docker container.
 
 To run tests inside a Docker container, you can just execute:
 
@@ -42,7 +37,7 @@ make integration-test
 
 ## Declarative tests
 
-Most tests written for KUTTL use the [declarative test harness](https://kudo.dev/docs/testing) with the controller-runtime's envtest (which starts `etcd` and `kube-apiserver` locally). This means that tests can be written for and run against KUTTL without requiring a Kubernetes cluster (or even Docker).
+Most tests written for KUTTL use the [declarative test harness](https://kuttl.dev) with the controller-runtime's envtest (which starts `etcd` and `kube-apiserver` locally). This means that tests can be written for and run against KUTTL without requiring a Kubernetes cluster (or even Docker).
 
 ### CLI examples
 

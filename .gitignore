@@ -8,6 +8,7 @@ reports/
 kuttl.yaml
 kuttl-report.json
 kuttl-report.xml
+kind-logs-*/
 
 
 ### mac
@@ -34,6 +35,7 @@ kuttl-report.xml
 
 ### gorelease
 dist/
+deps/
 
 ### VS Code
 .vscode/

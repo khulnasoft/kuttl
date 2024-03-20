@@ -2,23 +2,23 @@ package file
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	testutils "github.com/kudobuilder/kuttl/pkg/test/utils"
 )
 
 // from a list of paths, returns an array of runtime objects
-func ToRuntimeObjects(paths []string) ([]runtime.Object, error) {
-	apply := []runtime.Object{}
+func ToObjects(paths []string) ([]client.Object, error) {
+	apply := []client.Object{}
 
 	for _, path := range paths {
 		objs, err := testutils.LoadYAMLFromFile(path, "")
 		if err != nil {
-			return nil, fmt.Errorf("file %q load yaml error", path)
+			return nil, fmt.Errorf("file %q load yaml error: %w", path, err)
 		}
 		apply = append(apply, objs...)
 	}
@@ -40,7 +40,7 @@ func FromPath(path, pattern string) ([]string, error) {
 		return nil, fmt.Errorf("file mode issue with %w", err)
 	}
 	if fi.IsDir() {
-		fileInfos, err := ioutil.ReadDir(path)
+		fileInfos, err := os.ReadDir(path)
 		if err != nil {
 			return nil, err
 		}
@@ -58,4 +58,9 @@ func FromPath(path, pattern string) ([]string, error) {
 	}
 
 	return files, nil
+}
+
+// TrimExt removes the ext of a file path, foo.tar == foo
+func TrimExt(path string) string {
+	return strings.TrimSuffix(path, filepath.Ext(path))
 }

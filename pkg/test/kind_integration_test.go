@@ -1,6 +1,9 @@
-//+build integration
+//go:build integration
 
 package test
+
+// This test file is the only test that requires docker on the platform.  It may be worth creating a new build tag for that
+// but adds complexity for 1 case.
 
 import (
 	"bufio"
@@ -12,7 +15,7 @@ import (
 	"github.com/docker/docker/api/types"
 	dockerClient "github.com/docker/docker/client"
 	"github.com/thoas/go-funk"
-	"sigs.k8s.io/kind/pkg/apis/config/v1alpha3"
+	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 
 	testutils "github.com/kudobuilder/kuttl/pkg/test/utils"
@@ -30,17 +33,17 @@ func TestAddContainers(t *testing.T) {
 
 	kind := newKind(kindTestContext, "kubeconfig", testutils.NewTestLogger(t, ""))
 
-	config := v1alpha3.Cluster{}
+	config := v1alpha4.Cluster{}
 
 	if err := kind.Run(&config); err != nil {
 		t.Fatalf("failed to start KIND cluster: %v", err)
 	}
 
-	defer func() {
+	t.Cleanup(func() {
 		if err := kind.Stop(); err != nil {
 			t.Fatalf("failed to stop KIND cluster: %v", err)
 		}
-	}()
+	})
 
 	docker, err := dockerClient.NewClientWithOpts(dockerClient.FromEnv)
 	if err != nil {

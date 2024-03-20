@@ -1,4 +1,4 @@
-// +build integration
+//go:build integration
 
 package utils
 
@@ -24,7 +24,7 @@ var testenv TestEnvironment
 func TestMain(m *testing.M) {
 	var err error
 
-	testenv, err = StartTestEnvironment(APIServerDefaultArgs)
+	testenv, err = StartTestEnvironment(false)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -37,7 +37,13 @@ func TestMain(m *testing.M) {
 func TestCreateOrUpdate(t *testing.T) {
 	// Run the test a bunch of times to try to trigger a conflict and ensure that it handles conflicts properly.
 	for i := 0; i < 10; i++ {
-		depToUpdate := WithSpec(t, NewPod("update-me", fmt.Sprintf("default-%d", i)), map[string]interface{}{
+		namespaceName := fmt.Sprintf("default-%d", i)
+		namespaceObj := NewResource("v1", "Namespace", namespaceName, "default")
+
+		_, err := CreateOrUpdate(context.TODO(), testenv.Client, namespaceObj, true)
+		assert.Nil(t, err)
+
+		depToUpdate := WithSpec(t, NewPod("update-me", namespaceName), map[string]interface{}{
 			"containers": []map[string]interface{}{
 				{
 					"image": "nginx",
@@ -46,7 +52,7 @@ func TestCreateOrUpdate(t *testing.T) {
 			},
 		})
 
-		_, err := CreateOrUpdate(context.TODO(), testenv.Client, SetAnnotation(depToUpdate, "test", "hi"), true)
+		_, err = CreateOrUpdate(context.TODO(), testenv.Client, SetAnnotation(depToUpdate, "test", "hi"), true)
 		assert.Nil(t, err)
 
 		quit := make(chan bool)
@@ -97,17 +103,17 @@ func TestClientWatch(t *testing.T) {
 	event := <-eventCh
 	assert.Equal(t, watch.EventType("ADDED"), event.Type)
 	assert.Equal(t, gvk, event.Object.GetObjectKind().GroupVersionKind())
-	assert.Equal(t, client.ObjectKey{"default", "my-pod"}, ObjectKey(event.Object))
+	assert.Equal(t, client.ObjectKey{Namespace: "default", Name: "my-pod"}, ObjectKey(event.Object))
 
 	event = <-eventCh
 	assert.Equal(t, watch.EventType("MODIFIED"), event.Type)
 	assert.Equal(t, gvk, event.Object.GetObjectKind().GroupVersionKind())
-	assert.Equal(t, client.ObjectKey{"default", "my-pod"}, ObjectKey(event.Object))
+	assert.Equal(t, client.ObjectKey{Namespace: "default", Name: "my-pod"}, ObjectKey(event.Object))
 
 	event = <-eventCh
 	assert.Equal(t, watch.EventType("DELETED"), event.Type)
 	assert.Equal(t, gvk, event.Object.GetObjectKind().GroupVersionKind())
-	assert.Equal(t, client.ObjectKey{"default", "my-pod"}, ObjectKey(event.Object))
+	assert.Equal(t, client.ObjectKey{Namespace: "default", Name: "my-pod"}, ObjectKey(event.Object))
 
 	events.Stop()
 }
@@ -121,7 +127,7 @@ func TestRunCommand(t *testing.T) {
 
 	logger := NewTestLogger(t, "")
 	// assert foreground cmd returns nil
-	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.NoError(t, err)
 	assert.Nil(t, cmd)
 	// foreground processes should have stdout
@@ -131,7 +137,7 @@ func TestRunCommand(t *testing.T) {
 	stdout = &bytes.Buffer{}
 
 	// assert background cmd returns process
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.NoError(t, err)
 	assert.NotNil(t, cmd)
 	// no stdout for background processes
@@ -142,7 +148,7 @@ func TestRunCommand(t *testing.T) {
 	hcmd.Command = "sleep 42"
 
 	// assert foreground cmd times out
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 2)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 2, "")
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "timeout"))
 	assert.Nil(t, cmd)
@@ -153,11 +159,10 @@ func TestRunCommand(t *testing.T) {
 	hcmd.Timeout = 2
 
 	// assert foreground cmd times out with command timeout
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "timeout"))
 	assert.Nil(t, cmd)
-
 }
 
 func TestRunCommandIgnoreErrors(t *testing.T) {
@@ -170,12 +175,12 @@ func TestRunCommandIgnoreErrors(t *testing.T) {
 
 	logger := NewTestLogger(t, "")
 	// assert foreground cmd returns nil
-	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.NoError(t, err)
 	assert.Nil(t, cmd)
 
 	hcmd.IgnoreFailure = false
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.Error(t, err)
 	assert.Nil(t, cmd)
 
@@ -184,7 +189,7 @@ func TestRunCommandIgnoreErrors(t *testing.T) {
 		Command:       "bad-command",
 		IgnoreFailure: true,
 	}
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.Error(t, err)
 	assert.Nil(t, cmd)
 }
@@ -198,7 +203,7 @@ func TestRunCommandSkipLogOutput(t *testing.T) {
 
 	logger := NewTestLogger(t, "")
 	// test there is a stdout
-	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err := RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.NoError(t, err)
 	assert.Nil(t, cmd)
 	assert.True(t, stdout.Len() > 0)
@@ -207,7 +212,7 @@ func TestRunCommandSkipLogOutput(t *testing.T) {
 	stdout = &bytes.Buffer{}
 	stderr = &bytes.Buffer{}
 	// test there is no stdout
-	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0)
+	cmd, err = RunCommand(context.TODO(), "", hcmd, "", stdout, stderr, logger, 0, "")
 	assert.NoError(t, err)
 	assert.Nil(t, cmd)
 	assert.True(t, stdout.Len() == 0)

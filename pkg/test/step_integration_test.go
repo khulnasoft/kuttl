@@ -1,4 +1,4 @@
-// +build integration
+//go:build integration
 
 package test
 
@@ -16,7 +16,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -29,7 +28,7 @@ var testenv testutils.TestEnvironment
 func TestMain(m *testing.M) {
 	var err error
 
-	testenv, err = testutils.StartTestEnvironment(testutils.APIServerDefaultArgs)
+	testenv, err = testutils.StartTestEnvironment(false)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,13 +43,13 @@ func TestCheckResourceIntegration(t *testing.T) {
 
 	for _, test := range []struct {
 		testName    string
-		actual      []runtime.Object
-		expected    runtime.Object
+		actual      []client.Object
+		expected    client.Object
 		shouldError bool
 	}{
 		{
 			testName: "match object by labels, first in list matches",
-			actual: []runtime.Object{
+			actual: []client.Object{
 				testutils.WithSpec(t, testutils.WithLabels(t, testutils.NewPod("labels-match-pod", ""), map[string]string{
 					"app": "nginx",
 				}), map[string]interface{}{
@@ -94,7 +93,7 @@ func TestCheckResourceIntegration(t *testing.T) {
 		},
 		{
 			testName: "match object by labels, last in list matches",
-			actual: []runtime.Object{
+			actual: []client.Object{
 				testutils.WithSpec(t, testutils.WithLabels(t, testutils.NewPod("last-in-list", ""), map[string]string{
 					"app": "not-match",
 				}), map[string]interface{}{
@@ -138,7 +137,7 @@ func TestCheckResourceIntegration(t *testing.T) {
 		},
 		{
 			testName: "match object by labels, does not exist",
-			actual: []runtime.Object{
+			actual: []client.Object{
 				testutils.WithSpec(t, testutils.WithLabels(t, testutils.NewPod("hello", ""), map[string]string{
 					"app": "NOT-A-MATCH",
 				}), map[string]interface{}{
@@ -173,7 +172,7 @@ func TestCheckResourceIntegration(t *testing.T) {
 		},
 		{
 			testName: "match object by labels, field mismatch",
-			actual: []runtime.Object{
+			actual: []client.Object{
 				testutils.WithSpec(t, testutils.WithLabels(t, testutils.NewPod("hello", ""), map[string]string{
 					"app": "nginx",
 				}), map[string]interface{}{
@@ -208,7 +207,7 @@ func TestCheckResourceIntegration(t *testing.T) {
 		},
 		{
 			testName: "step should fail if there are no objects of the same type in the namespace",
-			actual:   []runtime.Object{},
+			actual:   []client.Object{},
 			expected: &unstructured.Unstructured{
 				Object: map[string]interface{}{
 					"apiVersion": "v1",
@@ -231,15 +230,15 @@ func TestCheckResourceIntegration(t *testing.T) {
 			shouldError: true,
 		},
 	} {
+		test := test
 		t.Run(test.testName, func(t *testing.T) {
-			namespace := fmt.Sprintf("kudo-test-%s", petname.Generate(2, "-"))
+			namespace := fmt.Sprintf("kuttl-test-%s", petname.Generate(2, "-"))
 
 			err := testenv.Client.Create(context.TODO(), testutils.NewResource("v1", "Namespace", namespace, ""))
 			if !k8serrors.IsAlreadyExists(err) {
 				// we are ignoring already exists here because in tests we by default use retry client so this can happen
 				assert.Nil(t, err)
 			}
-
 			for _, actual := range test.actual {
 				_, _, err := testutils.Namespaced(testenv.DiscoveryClient, actual, namespace)
 				assert.Nil(t, err)
@@ -290,7 +289,8 @@ func TestStepDeleteExistingLabelMatch(t *testing.T) {
 	}), podSpec)
 
 	step := Step{
-		Logger: testutils.NewTestLogger(t, ""),
+		Logger:  testutils.NewTestLogger(t, ""),
+		Timeout: 60,
 		Step: &harness.TestStep{
 			Delete: []harness.ObjectReference{
 				{
@@ -308,6 +308,9 @@ func TestStepDeleteExistingLabelMatch(t *testing.T) {
 		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
 	}
 
+	namespaceObj := testutils.NewResource("v1", "Namespace", namespace, "default")
+
+	assert.Nil(t, testenv.Client.Create(context.TODO(), namespaceObj))
 	assert.Nil(t, testenv.Client.Create(context.TODO(), podToKeep))
 	assert.Nil(t, testenv.Client.Create(context.TODO(), podToDelete))
 	assert.Nil(t, testenv.Client.Create(context.TODO(), podToDelete2))
@@ -332,6 +335,7 @@ func TestCheckedTypeAssertions(t *testing.T) {
 		{"apply", "TestStep"},
 	}
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			step := Step{}
 			path := fmt.Sprintf("step_integration_test_data/error_detect/00-%s.yaml", test.name)
@@ -342,12 +346,41 @@ func TestCheckedTypeAssertions(t *testing.T) {
 	}
 }
 
+func TestApplyExpansion(t *testing.T) {
+	os.Setenv("TEST_FOO", "test")
+	t.Cleanup(func() {
+		os.Unsetenv("TEST_FOO")
+	})
+
+	step := Step{Dir: "step_integration_test_data/assert_expand/"}
+	path := "step_integration_test_data/assert_expand/00-step1.yaml"
+	err := step.LoadYAML(path)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(step.Apply))
+}
+
+func TestOverriddenKubeconfigPathResolution(t *testing.T) {
+	os.Setenv("SUBPATH", "test")
+	t.Cleanup(func() {
+		os.Unsetenv("SUBPATH")
+	})
+	stepRelativePath := &Step{Dir: "step_integration_test_data/kubeconfig_path_resolution/"}
+	err := stepRelativePath.LoadYAML("step_integration_test_data/kubeconfig_path_resolution/00-step1.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, "step_integration_test_data/kubeconfig_path_resolution/kubeconfig-test.yaml", stepRelativePath.Kubeconfig)
+
+	stepAbsPath := &Step{Dir: "step_integration_test_data/kubeconfig_path_resolution/"}
+	err = stepAbsPath.LoadYAML("step_integration_test_data/kubeconfig_path_resolution/00-step2.yaml")
+	assert.NoError(t, err)
+	assert.Equal(t, "/absolute/kubeconfig-test.yaml", stepAbsPath.Kubeconfig)
+}
+
 func TestTwoTestStepping(t *testing.T) {
-	apply := []runtime.Object{}
+	apply := []client.Object{}
 	step := &Step{
-		Name:            "twostepping",
-		Index:           0,
-		Apply:           apply,
+		Name:  "twostepping",
+		Index: 0,
+		Apply: apply,
 	}
 
 	// 2 apply files in 1 step
@@ -358,11 +391,145 @@ func TestTwoTestStepping(t *testing.T) {
 
 	// 2 teststeps in 1 file in 1 step
 	step = &Step{
-		Name:            "twostepping",
-		Index:           0,
-		Apply:           apply,
+		Name:  "twostepping",
+		Index: 0,
+		Apply: apply,
 	}
 	err = step.LoadYAML("step_integration_test_data/two_step/01-step1.yaml")
 	assert.Error(t, err, "more than 1 TestStep not allowed in step \"twostepping\"")
 }
 
+// intentional testing that a test failure captures the test errors and does not have a segfault
+// driving by issue: https://github.com/kudobuilder/kuttl/issues/154
+func TestStepFailure(t *testing.T) {
+	// an assert without setup
+	var expected client.Object = &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]interface{}{
+				"labels": map[string]interface{}{
+					"app": "nginx",
+				},
+			},
+			"spec": map[string]interface{}{
+				"containers": []interface{}{
+					map[string]interface{}{
+						"image": "nginx:1.7.9",
+						"name":  "nginx",
+					},
+				},
+			},
+		},
+	}
+
+	namespace := fmt.Sprintf("kuttl-test-%s", petname.Generate(2, "-"))
+
+	err := testenv.Client.Create(context.TODO(), testutils.NewResource("v1", "Namespace", namespace, ""))
+	if !k8serrors.IsAlreadyExists(err) {
+		// we are ignoring already exists here because in tests we by default use retry client so this can happen
+		assert.Nil(t, err)
+	}
+
+	asserts := []client.Object{expected}
+	step := Step{
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+		Asserts:         asserts,
+		Timeout:         1,
+	}
+
+	errs := step.Run(t, namespace)
+	assert.Equal(t, len(errs), 1)
+}
+
+func TestAssertCommandsValidCommandRunsOk(t *testing.T) {
+	step := &Step{
+		Name:            t.Name(),
+		Index:           0,
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+	}
+
+	// Load test that has an echo command, so it should run ok, and don't return any errors
+	err := step.LoadYAML("step_integration_test_data/assert_commands/valid_command/00-assert.yaml")
+	assert.NoError(t, err)
+
+	errors := step.Run(t, "irrelevant")
+	assert.Equal(t, len(errors), 0)
+}
+
+func TestAssertCommandsMultipleCommandRunsOk(t *testing.T) {
+	step := &Step{
+		Name:            t.Name(),
+		Index:           0,
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+	}
+
+	// Load test that has an echo command, so it should run ok, and don't return any errors
+	err := step.LoadYAML("step_integration_test_data/assert_commands/multiple_commands/00-assert.yaml")
+	assert.NoError(t, err)
+
+	errors := step.Run(t, "irrelevant")
+	assert.Equal(t, len(errors), 0)
+}
+
+func TestAssertCommandsMissingCommandFails(t *testing.T) {
+	step := &Step{
+		Name:            t.Name(),
+		Index:           0,
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+	}
+
+	// Load test that has an command that is not present (thiscommanddoesnotexist), so it should return an error
+	err := step.LoadYAML("step_integration_test_data/assert_commands/command_does_not_exist/00-assert.yaml")
+	assert.NoError(t, err)
+
+	errors := step.Run(t, "irrelevant")
+	assert.Equal(t, len(errors), 1)
+}
+
+func TestAssertCommandsFailingCommandFails(t *testing.T) {
+	step := &Step{
+		Name:            t.Name(),
+		Index:           0,
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+	}
+
+	// Load test that has an command that is present but will allways fail (false), so we should get back the error.
+	err := step.LoadYAML("step_integration_test_data/assert_commands/failing_comand/00-assert.yaml")
+	assert.NoError(t, err)
+
+	errors := step.Run(t, "irrelevant")
+	assert.Equal(t, len(errors), 1)
+}
+
+func TestAssertCommandsShouldTimeout(t *testing.T) {
+	step := &Step{
+		Name:            t.Name(),
+		Index:           0,
+		Logger:          testutils.NewTestLogger(t, ""),
+		Client:          func(bool) (client.Client, error) { return testenv.Client, nil },
+		DiscoveryClient: func() (discovery.DiscoveryInterface, error) { return testenv.DiscoveryClient, nil },
+	}
+
+	// Load test that has an command that sleeps for 5 seconds, while the timeout for the step is 1,
+	// so we should get back the error, and the test should run in less slightly more than 1 seconds.
+	err := step.LoadYAML("step_integration_test_data/assert_commands/timingout_command/00-assert.yaml")
+	assert.NoError(t, err)
+
+	start := time.Now()
+	errors := step.Run(t, "irrelevant")
+	duration := time.Since(start).Seconds()
+	assert.Greater(t, duration, float64(1))
+	assert.Less(t, duration, float64(5))
+	assert.Equal(t, len(errors), 1)
+}
